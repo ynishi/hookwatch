@@ -1,0 +1,17 @@
+{
+  "jigs": [
+    {
+      "id": "term-shadow-md",
+      "description": "Markdown prose writes the lifecycle term as Shadow (rework 2026-11-14)",
+      "rule": {
+        "kind": "command",
+        "argv": ["python3", "-I", "$HOME/projects/hookwatch/jigs/term_shadow_md.py"],
+        "timeout_ms": 2000
+      },
+      "action": "nudge",
+      "lifecycle": "enforce",
+      "message": "用語は Shadow と表記する (人の直し 2026-11-14)",
+      "when": { "tools": ["Write", "Edit", "MultiEdit"], "path": "\\.md$" }
+    }
+  ]
+}

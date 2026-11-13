@@ -1,0 +1,45 @@
+# hookwatch
+
+Friction-measured hook engine (jigs) for coding agents
+
+A prototype: `[package.metadata.caps] stage = "prototype"` in Cargo.toml marks it, and it is not published (`publish = false`).
+
+## What’s hookwatch?
+
+hookwatch は Claude Code の hook として動き、agent の作業を 2 つの面から見る。
+
+- 治具 (jig): tool の呼び出しを、実行の前に決定的な規則で判定する。止める (block)、注意を添える (nudge)、記録だけする (shadow) のどれかを選べる
+- ストップウォッチ: 全ての hook event を Friction Ledger (SQLite) に記録し、人の手間を数える。割り込み (cut-in)、permission と質問の待ち時間、Deny、tool の失敗、人の手直し (Rework)
+
+治具は人の判断で研ぐ。誤った判定には人がラベルを付け、その数が治具の精度になる。
+
+## How to use.
+
+| command | 何をするか |
+|---|---|
+| `hookwatch hook` | hook として呼ばれる。event の JSON を stdin で受ける |
+| `hookwatch stats` | ストップウォッチの数字と、治具ごとの発火数・精度 |
+| `hookwatch why [id]` | 判定の一覧、または 1 件の根拠と tool の入力 |
+| `hookwatch override <id> --wrong\|--right` | 判定に人のラベルを付ける |
+| `hookwatch events` | 記録した event を古い順に出す |
+| `hookwatch jigs` | 効いている治具の一覧 |
+| `hookwatch install` | settings に足す hooks の JSON を出す |
+
+記録は `$HOME/.hookwatch/ledger.db`、治具の追加と lifecycle の上書きは `$HOME/.hookwatch/jigs.json` に置く (`HOOKWATCH_HOME` で場所を変えられる)。
+
+## 組み込みの治具
+
+| id | 既定 | 何を見るか |
+|---|---|---|
+| no-verify | enforce | git の hook を飛ばす `--no-verify` |
+| secret-in-file | enforce | 秘密鍵や cloud の credential を file に書くこと |
+| tamper-guard | enforce | hook の設定と hookwatch 自身の状態への書き込み (読むのは止めない) |
+| test-weakening | shadow | test の assert を減らす、skip を足す編集 |
+
+## Rework の数え方
+
+agent のターンが終わった時 (Stop) に、そのターンで agent が Edit / Write した file の中身を写しとして取る。次のプロンプトの時に今の中身と比べ、違えば人がターンの間に直したとして、変わった行数を記録する。
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.

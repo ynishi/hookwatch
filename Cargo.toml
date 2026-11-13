@@ -1,0 +1,25 @@
+[package]
+name = "hookwatch"
+version = "0.1.0"
+edition = "2024"
+description = "Friction-measured hook engine (jigs) for coding agents"
+license = "MIT OR Apache-2.0"
+authors = ["Yutaka Nishimura <ytk.nishimura@gmail.com>"]
+publish = false
+
+# A prototype: speed first. Promote it by removing `stage` and applying the
+# production lints.
+[package.metadata.caps]
+stage = "prototype"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+regex = "1.13.1"
+rusqlite = { version = "0.42.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+uuid = { version = "1.29.2", features = ["v7"] }
