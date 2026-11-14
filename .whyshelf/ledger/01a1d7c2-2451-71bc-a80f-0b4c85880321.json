@@ -1,0 +1,15 @@
+{
+  "actor": "Yutaka Nishimura",
+  "at": 1794621186805,
+  "expires": null,
+  "frame": [],
+  "id": "01a1d7c2-2451-71bc-a80f-0b4c85880321",
+  "kind": "decision",
+  "reason": "read on 2026-11-14: the promises hookwatch keeps, as built and tested at b1b60d5 and tests/human_only.rs",
+  "revision": "b1b60d5ded92d4d0e43aa1d7ffdf6536a4390c1f",
+  "seen": "sha256:dee9f792f1454cf972f33bfca7485f655391a9291a127e3c5d933f191da88079",
+  "seen_address": "94a0ba97eca3538c3f0e2e0c49281002b26ba726",
+  "subject": "01a1d7bf-c70f-7073-bfe2-55d6d197d373",
+  "v": 1,
+  "verb": "approve"
+}

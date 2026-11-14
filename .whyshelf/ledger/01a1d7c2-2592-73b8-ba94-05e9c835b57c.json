@@ -1,0 +1,25 @@
+{
+  "actor": "Yutaka Nishimura",
+  "artifacts": [
+    {
+      "address": "95f4fc16f0a846c1ec6e21c7a46e5847b93b048c",
+      "hash": "sha256:ed88c33250398cbdf0a42727e94caf8b5e4ac17a0b30b0b92345318c4e05e05e",
+      "link": "tests",
+      "name": "tests/human_only.rs",
+      "space": "file",
+      "state": "present"
+    }
+  ],
+  "at": 1794621186805,
+  "expires": null,
+  "frame": [],
+  "id": "01a1d7c2-2592-73b8-ba94-05e9c835b57c",
+  "kind": "decision",
+  "reason": "read on 2026-11-14: the promises hookwatch keeps, as built and tested at b1b60d5 and tests/human_only.rs",
+  "revision": "b1b60d5ded92d4d0e43aa1d7ffdf6536a4390c1f",
+  "seen": "sha256:7583889f8afb09388b755a0f03289fc4c1997b194df570161f0f3562f5c78267",
+  "seen_address": "ef9df1e253cfaf11229baf0520c4df994ed3692b",
+  "subject": "01a1d7bf-c735-74f8-9327-5d48259b83f4",
+  "v": 1,
+  "verb": "approve"
+}

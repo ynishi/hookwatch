@@ -10,6 +10,13 @@ check:
     cargo fmt
     cargo test
 
+# books/ holds what must keep holding (whyshelf, qa-first). A change that makes
+# an approval stale is listed here: re-check that promise before approving again.
+# The promises in books/ and whether their approvals still hold.
+books:
+    whyshelf check
+    whyshelf stale --exit-code
+
 # Hooks pick up the new binary on their next call. Adding the hooks to Claude
 # Code's settings is a separate, one-time step: see `hookwatch install`.
 # Install (or reinstall) the hookwatch command.
