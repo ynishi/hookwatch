@@ -1,0 +1,10 @@
+{
+  "name": "hookwatch",
+  "version": "0.1.0",
+  "description": "Records hook events and human friction in a ledger, runs jigs on tool calls, and lets an AI propose new jigs from the friction. Enable it per repo.",
+  "author": {
+    "name": "Yutaka Nishimura"
+  },
+  "license": "MIT OR Apache-2.0",
+  "types": "./types/index.d.ts"
+}

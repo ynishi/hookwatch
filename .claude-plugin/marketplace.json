@@ -1,0 +1,12 @@
+{
+  "name": "hookwatch",
+  "owner": { "name": "Yutaka Nishimura" },
+  "description": "hookwatch: hook engine and friction ledger for coding agents",
+  "plugins": [
+    {
+      "name": "hookwatch",
+      "source": "./plugin",
+      "description": "Friction-measured hook engine (jigs) for coding agents"
+    }
+  ]
+}

@@ -13,6 +13,16 @@ hookwatch は Claude Code の hook として動き、agent の作業を 2 つの
 
 治具は人の判断で研ぐ。誤った判定には人がラベルを付け、その数が治具の精度になる。
 
+## Install
+
+hookwatch は Claude Code の plugin として、使う repo ごとに有効にする (user 全体には入れない)。
+
+1. command を入れる: この repo で `just install` (`cargo install --locked --path .`)。gitleaks も要る (ledger に入る credential を伏せる)
+2. marketplace を足す (1 回だけ): `claude plugin marketplace add <この repo の path>`
+3. 使う repo で有効にする: その repo で `claude plugin install hookwatch@hookwatch --scope local`
+
+plugin の hooks は `plugin/scripts/hook.sh` を経て `hookwatch hook` を呼ぶ。command か gitleaks が無い時は記録せずに通し、session の開始時にそれを知らせる。plugin には skill `hookwatch` (記録の読み方) と `jig-smith` (摩擦から治具を提案する) が入る。管理画面はチャットの横の pane で、`/hookwatch-pane` で開く (幅が 144 列以上なら session の開始時に開く)。判定と提案の行のボタンは、人が端末で打つコマンドをクリップボードに写す (agent からは打てないコマンドなので、mod も実行しない)。
+
 ## How to use.
 
 | command | 何をするか |
@@ -24,7 +34,10 @@ hookwatch は Claude Code の hook として動き、agent の作業を 2 つの
 | `hookwatch events` | 記録した event を古い順に出す |
 | `hookwatch jigs` | 効いている治具の一覧 |
 | `hookwatch put-jigs <file>` | 治具の file を効かせる (前の file は写しを残す)。端末が要る (人だけ)。`just jigs` は repo の `jigs/jigs.json` でこれを呼ぶ |
-| `hookwatch install` | settings に足す hooks の JSON を出す |
+| `hookwatch status` | ledger の大きさと、人の判断を待つ物 |
+| `hookwatch episodes` / `smith-input` / `propose` / `proposals` | 摩擦の材料と、治具の提案 (skill `jig-smith`) |
+| `hookwatch accept` / `reject` / `prune` | 提案の判断、ledger を縮める。端末が要る (人だけ) |
+| `hookwatch install` | plugin を使わずに settings に足す時の hooks の JSON を出す |
 
 記録は `$HOME/.hookwatch/ledger.db`、治具の追加と lifecycle の上書きは `$HOME/.hookwatch/jigs.json` に置く (`HOOKWATCH_HOME` で場所を変えられる)。
 

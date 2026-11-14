@@ -35,7 +35,8 @@ enum Cmd {
     Hook,
     /// Show recent verdicts, or one verdict in full.
     Why { id: Option<String> },
-    /// Label a verdict: the human says the jig was wrong or right.
+    /// Label a verdict: the human says the jig was wrong or right. Needs a
+    /// terminal, so an agent cannot label its own verdicts.
     Override {
         id: String,
         #[arg(long, conflicts_with = "right", required_unless_present = "right")]
@@ -54,6 +55,13 @@ enum Cmd {
     /// The ledger's size and what waits for the human (open proposals,
     /// unlabelled verdicts). Also shown at session start when it matters.
     Status,
+    /// Everything a management view shows, as one JSON: status, the jigs
+    /// with their counts, recent proposals and verdicts, and the stopwatch
+    /// (of --repo when given). Read-only.
+    Panel {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Credentials in stored rows are replaced; tool outputs of PostToolUse
     /// events and checked file snapshots older than --days are dropped (replay
     /// and episodes keep working). Then the file is compacted. Needs a terminal.
@@ -187,6 +195,8 @@ fn main() -> anyhow::Result<()> {
             right: _,
             note,
         } => {
+            // A label is the ground truth of a jig's precision: the human's.
+            need_terminal("override")?;
             let l = ledger()?;
             let v = l.verdict_by_short(&id)?;
             let label = if wrong { "wrong" } else { "right" };
@@ -202,6 +212,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Prune { days } => prune(days),
+        Cmd::Panel { repo } => panel(repo.as_deref()),
         Cmd::Events {
             session,
             kinds,
@@ -472,6 +483,70 @@ fn status_lines(l: &Ledger, always: bool) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
+fn panel(repo: Option<&std::path::Path>) -> anyhow::Result<()> {
+    use serde_json::json;
+    let l = ledger()?;
+    let s = l.status()?;
+    let file = std::fs::metadata(home().join("ledger.db"))
+        .context("ledger.db")?
+        .len();
+    let counts = l.jig_counts()?;
+    let jigs: Vec<_> = load_jigs()?
+        .iter()
+        .map(|j| {
+            let c = counts.iter().find(|c| c.jig == j.id);
+            let n = |f: fn(&ledger::JigCount) -> i64| c.map(f).unwrap_or(0); // a jig that never fired
+            json!({
+                "id": j.id, "lifecycle": j.lifecycle.as_str(), "action": j.action.as_str(),
+                "description": j.description,
+                "fires": n(|c| c.fires), "applied": n(|c| c.applied),
+                "wrong": n(|c| c.wrong), "right": n(|c| c.right),
+            })
+        })
+        .collect();
+    let proposals: Vec<_> = l
+        .proposals()?
+        .iter()
+        .take(10)
+        .map(|p| json!({"id": short(&p.id), "ts_ms": p.ts_ms, "status": p.status, "outlet": p.outlet, "intent": p.intent}))
+        .collect();
+    let verdicts: Vec<_> = l
+        .recent_verdicts(10)?
+        .iter()
+        .map(|v| {
+            json!({"id": short(&v.id), "ts_ms": v.ts_ms, "jig": v.jig, "action": v.action,
+                   "applied": v.applied, "label": v.label, "evidence": v.evidence})
+        })
+        .collect();
+    let (evs, reworks, _) = load_scoped(&l, repo)?;
+    let stream: Vec<(String, i64, String)> = evs
+        .into_iter()
+        .map(|e| (e.session, e.ts_ms, e.kind))
+        .collect();
+    let f = friction::measure(&stream);
+    let out = json!({
+        "now_ms": now_ms(),
+        "status": {
+            "events": s.events, "file_bytes": file, "last_prune_ms": s.last_prune_ms,
+            "open_proposals": s.open_proposals, "unlabelled_applied": s.unlabelled_applied,
+            "attention": status_lines(&l, false)?,
+        },
+        "stopwatch": {
+            "repo": repo.map(|r| r.display().to_string()),
+            "sessions": f.sessions, "turns": f.turns, "cut_ins": f.cut_ins,
+            "permission_wait_ms": f.wait_total_ms(), "question_wait_ms": f.question_waits_ms.iter().sum::<i64>(),
+            "denied": f.denied, "tool_failures": f.tool_failures,
+            "rework_files": reworks.len(),
+            "rework_lines": reworks.iter().map(|r| r.added + r.removed).sum::<i64>(),
+        },
+        "jigs": jigs,
+        "proposals": proposals,
+        "verdicts": verdicts,
+    });
+    println!("{out}");
+    Ok(())
+}
+
 fn prune(days: i64) -> anyhow::Result<()> {
     need_terminal("prune")?;
     let l = ledger()?;
@@ -658,6 +733,7 @@ fn rule_places(repo: &std::path::Path) -> anyhow::Result<Vec<String>> {
     md_in(repo.to_path_buf(), false)?;
     md_in(repo.join("docs"), false)?;
     md_in(repo.join("skills"), true)?;
+    md_in(repo.join("plugin").join("skills"), true)?;
     out.sort();
     Ok(out)
 }
