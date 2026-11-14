@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
   id TEXT PRIMARY KEY, session TEXT NOT NULL, path TEXT NOT NULL, ts_ms INTEGER NOT NULL,
   content TEXT NOT NULL, checked INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS snapshots_open ON snapshots(session, checked);
+-- Small facts about the ledger itself (e.g. when it was last pruned).
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 -- Proposals from Jig Smith. Kept when rejected, so the same idea is not
 -- proposed again without saying what changed.
 CREATE TABLE IF NOT EXISTS proposals (
@@ -107,6 +109,31 @@ pub struct Snapshot {
     pub id: String,
     pub path: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PruneReport {
+    /// Rows where a credential was replaced (events, snapshots, rework).
+    pub redacted: usize,
+    /// PostToolUse events older than the cutoff whose tool output was dropped.
+    pub outputs_dropped: usize,
+    /// Checked snapshots older than the cutoff whose content was dropped.
+    pub snapshots_emptied: usize,
+    /// Event rows that were not JSON, replaced by a row that says the payload
+    /// was lost.
+    pub repaired: usize,
+    pub bytes_before: i64,
+    pub bytes_after: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Status {
+    pub events: i64,
+    pub payload_bytes: i64,
+    pub open_proposals: i64,
+    /// Verdicts that acted on the agent and have no human label yet.
+    pub unlabelled_applied: i64,
+    pub last_prune_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,15 +219,6 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         conn.execute("ALTER TABLE rework ADD COLUMN diff TEXT", [])?;
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ReworkTotals {
-    /// Turns (stops) after which the human changed at least one file.
-    pub turns: i64,
-    pub files: i64,
-    pub added: i64,
-    pub removed: i64,
 }
 
 const VERDICT_COLS: &str = "v.id, v.ts_ms, v.event_id, v.session, v.jig, v.action, v.lifecycle, v.applied, v.message, v.evidence,
@@ -365,6 +383,207 @@ impl Ledger {
         }
     }
 
+    /// (id, payload) of the session's events since its last prompt.
+    pub fn turn_rows(&self, session: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, payload FROM events
+             WHERE session = ?1
+               AND ts_ms >= COALESCE((SELECT MAX(ts_ms) FROM events
+                                      WHERE session = ?1 AND event = 'UserPromptSubmit'), 0)",
+        )?;
+        let rows = st.query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn set_payload(&self, id: &str, payload: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE events SET payload = ?2 WHERE id = ?1",
+            params![id, payload],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored text that may hold a credential: event payloads,
+    /// snapshot contents, rework diffs. For one scan before `prune`.
+    pub fn all_texts(&self) -> anyhow::Result<Vec<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT payload FROM events UNION ALL SELECT content FROM snapshots
+             UNION ALL SELECT diff FROM rework WHERE diff IS NOT NULL",
+        )?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    fn stored_bytes(&self) -> anyhow::Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE((SELECT SUM(length(payload)) FROM events), 0)
+                  + COALESCE((SELECT SUM(length(content)) FROM snapshots), 0)
+                  + COALESCE((SELECT SUM(length(diff)) FROM rework), 0)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Redact every stored text with `redact`, drop tool outputs of
+    /// PostToolUse events before `cutoff_ms` (replay and episodes use only
+    /// tool_input), and empty checked snapshots before it. One transaction;
+    /// the caller vacuums after. Rows that are not JSON stop it.
+    pub fn prune(
+        &self,
+        cutoff_ms: i64,
+        now_ms: i64,
+        redact: &dyn Fn(&str) -> (String, usize),
+    ) -> anyhow::Result<PruneReport> {
+        let mut rep = PruneReport {
+            bytes_before: self.stored_bytes()?,
+            ..Default::default()
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut st = tx.prepare("SELECT id, ts_ms, event, payload FROM events")?;
+            let rows: Vec<(String, i64, String, String)> = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<Result<_, _>>()?;
+            for (id, ts, event, payload) in rows {
+                let (mut text, n) = redact(&payload);
+                if n > 0 {
+                    rep.redacted += 1;
+                }
+                let parsed = serde_json::from_str::<serde_json::Value>(&text);
+                let Ok(mut v) = parsed else {
+                    // The tail of these rows is gone (the regex masking of
+                    // 2026-11-14 cut it). Keep a readable row that says so,
+                    // with what the columns still know.
+                    let (session, tool): (String, Option<String>) = tx.query_row(
+                        "SELECT session, tool FROM events WHERE id = ?1",
+                        [&id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
+                    text = serde_json::json!({
+                        "hook_event_name": event, "session_id": session, "tool_name": tool,
+                        "hookwatch_damaged": "payload lost: it was not JSON when pruned",
+                    })
+                    .to_string();
+                    rep.repaired += 1;
+                    tx.execute(
+                        "UPDATE events SET payload = ?2 WHERE id = ?1",
+                        params![id, text],
+                    )?;
+                    continue;
+                };
+                if event == "PostToolUse"
+                    && ts < cutoff_ms
+                    && let Some(obj) = v.as_object_mut()
+                    && obj.remove("tool_response").is_some()
+                {
+                    rep.outputs_dropped += 1;
+                    text = v.to_string();
+                }
+                if text != payload {
+                    tx.execute(
+                        "UPDATE events SET payload = ?2 WHERE id = ?1",
+                        params![id, text],
+                    )?;
+                }
+            }
+        }
+        {
+            let mut st = tx.prepare("SELECT id, ts_ms, checked, content FROM snapshots")?;
+            let rows: Vec<(String, i64, i64, String)> = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<Result<_, _>>()?;
+            for (id, ts, checked, content) in rows {
+                let new = if checked != 0 && ts < cutoff_ms && !content.is_empty() {
+                    rep.snapshots_emptied += 1;
+                    String::new()
+                } else {
+                    let (t, n) = redact(&content);
+                    if n > 0 {
+                        rep.redacted += 1;
+                    }
+                    t
+                };
+                if new != content {
+                    tx.execute(
+                        "UPDATE snapshots SET content = ?2 WHERE id = ?1",
+                        params![id, new],
+                    )?;
+                }
+            }
+        }
+        {
+            let mut st = tx.prepare("SELECT id, diff FROM rework WHERE diff IS NOT NULL")?;
+            let rows: Vec<(String, String)> = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            for (id, diff) in rows {
+                let (t, n) = redact(&diff);
+                if n > 0 {
+                    rep.redacted += 1;
+                    tx.execute("UPDATE rework SET diff = ?2 WHERE id = ?1", params![id, t])?;
+                }
+            }
+        }
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('last_prune_ms', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [now_ms.to_string()],
+        )?;
+        tx.commit()?;
+        rep.bytes_after = self.stored_bytes()?;
+        Ok(rep)
+    }
+
+    /// A consistent copy of the whole ledger (SQLite VACUUM INTO).
+    pub fn backup_to(&self, path: &Path) -> anyhow::Result<()> {
+        let p = path.to_str().context("backup path is not UTF-8")?;
+        self.conn
+            .execute("VACUUM INTO ?1", [p])
+            .with_context(|| format!("back up to {p}"))?;
+        Ok(())
+    }
+
+    /// Give the freed pages back to the file system.
+    pub fn vacuum(&self) -> anyhow::Result<()> {
+        self.conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
+    pub fn status(&self) -> anyhow::Result<Status> {
+        let last: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'last_prune_ms'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let last_prune_ms = match last {
+            Some(s) => Some(
+                s.parse()
+                    .with_context(|| format!("meta last_prune_ms is not a number: {s}"))?,
+            ),
+            None => None, // never pruned
+        };
+        Ok(self.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM events),
+                    (SELECT COALESCE(SUM(length(payload)), 0) FROM events),
+                    (SELECT COUNT(*) FROM proposals WHERE status = 'open'),
+                    (SELECT COUNT(*) FROM verdicts v WHERE v.applied = 1
+                       AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.verdict_id = v.id))",
+            [],
+            |r| {
+                Ok(Status {
+                    events: r.get(0)?,
+                    payload_bytes: r.get(1)?,
+                    open_proposals: r.get(2)?,
+                    unlabelled_applied: r.get(3)?,
+                    last_prune_ms,
+                })
+            },
+        )?)
+    }
+
     /// (tool_name, tool_input) of every call whose verdict the human last
     /// labelled right: hits a human has confirmed.
     pub fn right_labelled_calls(&self) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
@@ -495,34 +714,6 @@ impl Ledger {
                 label: r.get(6)?,
                 note: r.get(7)?,
             })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    pub fn rework_totals(&self) -> anyhow::Result<ReworkTotals> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(DISTINCT r.session || ':' || s.ts_ms), COUNT(*),
-                    COALESCE(SUM(r.added), 0), COALESCE(SUM(r.removed), 0)
-             FROM rework r JOIN snapshots s ON s.id = r.snapshot_id",
-            [],
-            |r| {
-                Ok(ReworkTotals {
-                    turns: r.get(0)?,
-                    files: r.get(1)?,
-                    added: r.get(2)?,
-                    removed: r.get(3)?,
-                })
-            },
-        )?)
-    }
-
-    /// (path, added, removed, ts_ms), newest first.
-    pub fn recent_rework(&self, limit: i64) -> anyhow::Result<Vec<(String, i64, i64, i64)>> {
-        let mut st = self.conn.prepare(
-            "SELECT path, added, removed, ts_ms FROM rework ORDER BY ts_ms DESC LIMIT ?1",
-        )?;
-        let rows = st.query_map([limit], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -746,15 +937,103 @@ mod tests {
         assert!(l.open_snapshots("s").unwrap().is_empty());
         let rows = l.rework_rows().unwrap();
         assert_eq!(rows[0].diff.as_deref(), Some("diff of r1"));
+        // Both files closed by one check: one turn, two files, +3 -1.
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.ts_ms == 20 && r.session == "s"));
+        let added: i64 = rows.iter().map(|r| r.added).sum();
+        let removed: i64 = rows.iter().map(|r| r.removed).sum();
+        assert_eq!((added, removed), (3, 1));
+    }
+
+    #[test]
+    fn prune_drops_old_outputs_and_snapshots_and_redacts_everything() {
+        let l = Ledger::in_memory().unwrap();
+        let post = |id, ts, out: &str| {
+            let p = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": out});
+            l.add_event(&EventRow {
+                id,
+                ts_ms: ts,
+                session: "s",
+                event: "PostToolUse",
+                tool: Some("Bash"),
+                payload: &p.to_string(),
+            })
+            .unwrap();
+        };
+        post("old", 10, "SECRETWORD in an old output");
+        post("new", 100, "fresh output");
+        l.put_snapshot("snap-old", "s", "/r/a", 10, "old text")
+            .unwrap();
+        let open = l.open_snapshots("s").unwrap();
+        l.close_snapshot(&open[0], "s", None).unwrap();
+        l.put_snapshot("snap-new", "s", "/r/b", 100, "has SECRETWORD")
+            .unwrap();
+        // A stand-in for jig::redact, so this test holds no credential.
+        let redact = |t: &str| {
+            (
+                t.replace("SECRETWORD", "[R]"),
+                t.matches("SECRETWORD").count(),
+            )
+        };
+
+        let r = l.prune(50, 200, &redact).unwrap();
         assert_eq!(
-            l.rework_totals().unwrap(),
-            ReworkTotals {
-                turns: 1,
-                files: 2,
-                added: 3,
-                removed: 1
-            }
+            (r.redacted, r.outputs_dropped, r.snapshots_emptied),
+            (2, 1, 1)
         );
+        assert!(r.bytes_after < r.bytes_before);
+        let payload = |id: &str| -> serde_json::Value {
+            serde_json::from_str(
+                &l.conn
+                    .query_row("SELECT payload FROM events WHERE id = ?1", [id], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(payload("old").get("tool_response").is_none());
+        assert_eq!(payload("old")["tool_input"]["command"], "ls"); // replay still has the call
+        assert_eq!(payload("new")["tool_response"], "fresh output");
+        assert_eq!(l.open_snapshots("s").unwrap()[0].content, "has [R]");
+        assert_eq!(l.status().unwrap().last_prune_ms, Some(200));
+        // Twice is a no-op.
+        let r = l.prune(50, 300, &redact).unwrap();
+        assert_eq!(
+            (r.redacted, r.outputs_dropped, r.snapshots_emptied),
+            (0, 0, 0)
+        );
+    }
+
+    /// The rows the regex masking of 2026-11-14 cut: prune makes them
+    /// readable again and says the payload was lost.
+    #[test]
+    fn prune_repairs_rows_that_are_not_json() {
+        let l = Ledger::in_memory().unwrap();
+        l.add_event(&EventRow {
+            id: "cut",
+            ts_ms: 1,
+            session: "s",
+            event: "PreToolUse",
+            tool: Some("Edit"),
+            payload: r#"{"tool_input":{"x":"abc"#,
+        })
+        .unwrap();
+        let r = l.prune(0, 2, &|t: &str| (t.to_owned(), 0)).unwrap();
+        assert_eq!(r.repaired, 1);
+        let p: serde_json::Value = serde_json::from_str(
+            &l.conn
+                .query_row("SELECT payload FROM events WHERE id = 'cut'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (p["tool_name"].as_str(), p["session_id"].as_str()),
+            (Some("Edit"), Some("s"))
+        );
+        assert!(p.get("hookwatch_damaged").is_some());
     }
 
     #[test]

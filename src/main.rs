@@ -9,6 +9,7 @@ mod episode;
 mod friction;
 mod jig;
 mod ledger;
+mod mask;
 mod proposal;
 mod replay;
 mod rework;
@@ -45,7 +46,22 @@ enum Cmd {
         note: Option<String>,
     },
     /// Friction measures and per-jig counts.
-    Stats,
+    Stats {
+        /// Only sessions that worked in this repo (by the hook's cwd).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// The ledger's size and what waits for the human (open proposals,
+    /// unlabelled verdicts). Also shown at session start when it matters.
+    Status,
+    /// Credentials in stored rows are replaced; tool outputs of PostToolUse
+    /// events and checked file snapshots older than --days are dropped (replay
+    /// and episodes keep working). Then the file is compacted. Needs a terminal.
+    /// Shrink the ledger and redact what it holds.
+    Prune {
+        #[arg(long, default_value_t = 14)]
+        days: i64,
+    },
     /// The recorded hook events, oldest first. The way to read the ledger:
     /// an agent does not need to open hookwatch's state files itself.
     Events {
@@ -71,6 +87,9 @@ enum Cmd {
         /// How many tool calls before each friction to include.
         #[arg(long, default_value_t = 5)]
         context: usize,
+        /// Only sessions that worked in this repo.
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
     /// Run jigs over the recorded tool calls and show what they would have
     /// hit, and what happened to those calls. Checks a jig before it goes in.
@@ -175,7 +194,14 @@ fn main() -> anyhow::Result<()> {
             println!("labelled {} ({}) as {label}", short(&v.id), v.jig);
             Ok(())
         }
-        Cmd::Stats => stats(),
+        Cmd::Stats { repo } => stats(repo.as_deref()),
+        Cmd::Status => {
+            for line in status_lines(&ledger()?, true)? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Cmd::Prune { days } => prune(days),
         Cmd::Events {
             session,
             kinds,
@@ -185,7 +211,8 @@ fn main() -> anyhow::Result<()> {
             json,
             last,
             context,
-        } => episodes(json, last, context),
+            repo,
+        } => episodes(json, last, context, repo.as_deref()),
         Cmd::Replay { file } => replay(file),
         Cmd::SmithInput { last, repo } => smith_input(last, &repo),
         Cmd::Propose { file, dry_run } => propose(&file, dry_run),
@@ -229,6 +256,8 @@ fn hook() -> anyhow::Result<i32> {
     let l = ledger()?;
     let ts = now_ms();
     let event_id = new_id();
+    // Stored as it came; credentials are masked once per turn, at Stop
+    // (one gitleaks run per turn instead of one per event).
     l.add_event(&EventRow {
         id: &event_id,
         ts_ms: ts,
@@ -242,6 +271,16 @@ fn hook() -> anyhow::Result<i32> {
         "Stop" => take_snapshots(&l, session, ts)?,
         "UserPromptSubmit" | "SessionEnd" => check_rework(&l, session, ts)?,
         _ => {}
+    }
+    if event == "SessionStart" {
+        // Tell the human (not the agent) what waits for them, only when
+        // something does. `systemMessage` is shown to the user.
+        let lines = status_lines(&l, false)?;
+        if !lines.is_empty() {
+            let msg = format!("hookwatch: {}", lines.join(" / "));
+            println!("{}", serde_json::json!({ "systemMessage": msg }));
+        }
+        return Ok(0);
     }
     if event != "PreToolUse" {
         return Ok(0);
@@ -334,6 +373,142 @@ fn events(session: Option<String>, kinds: &[String], last: i64) -> anyhow::Resul
     Ok(())
 }
 
+/// Sessions that worked in `repo`: any of their events has a cwd at or
+/// under it. hookwatch is set up per repo, so one ledger holds many repos.
+fn sessions_in(
+    evs: &[episode::Ev],
+    repo: &std::path::Path,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let root = repo
+        .canonicalize()
+        .with_context(|| format!("repo {} does not exist", repo.display()))?;
+    let root = root.to_string_lossy().into_owned();
+    let under = |cwd: &str| cwd == root || cwd.starts_with(&format!("{root}/"));
+    Ok(evs
+        .iter()
+        .filter(|e| {
+            e.payload
+                .get("cwd")
+                .and_then(|c| c.as_str())
+                .is_some_and(under)
+        })
+        .map(|e| e.session.clone())
+        .collect())
+}
+
+/// The events, reworks and labels of the sessions in `repo` (all when None).
+fn load_scoped(
+    l: &Ledger,
+    repo: Option<&std::path::Path>,
+) -> anyhow::Result<(
+    Vec<episode::Ev>,
+    Vec<ledger::ReworkRow>,
+    Vec<ledger::LabelRow>,
+)> {
+    let evs = load_evs(l)?;
+    let (reworks, labels) = (l.rework_rows()?, l.label_rows()?);
+    let Some(repo) = repo else {
+        return Ok((evs, reworks, labels));
+    };
+    let keep = sessions_in(&evs, repo)?;
+    Ok((
+        evs.into_iter()
+            .filter(|e| keep.contains(&e.session))
+            .collect(),
+        reworks
+            .into_iter()
+            .filter(|r| keep.contains(&r.session))
+            .collect(),
+        labels
+            .into_iter()
+            .filter(|x| keep.contains(&x.session))
+            .collect(),
+    ))
+}
+
+/// What the human should know about the ledger. `always`: also when all is
+/// well (the status command); otherwise only lines that ask for action.
+fn status_lines(l: &Ledger, always: bool) -> anyhow::Result<Vec<String>> {
+    const BIG: i64 = 50 * 1024 * 1024;
+    const PRUNE_EVERY_MS: i64 = 14 * 86_400_000;
+    let s = l.status()?;
+    let file = std::fs::metadata(home().join("ledger.db"))
+        .context("ledger.db")?
+        .len() as i64;
+    let mut out = vec![];
+    if always {
+        out.push(format!(
+            "ledger: {} events, file {:.1} MB, last prune {}",
+            s.events,
+            file as f64 / 1048576.0,
+            match s.last_prune_ms {
+                Some(t) => format!("{} ago", ago(t)),
+                None => "never".into(),
+            }
+        ));
+    }
+    let stale = match s.last_prune_ms {
+        Some(t) => now_ms() - t > PRUNE_EVERY_MS,
+        None => s.events > 0,
+    };
+    if file > BIG || (stale && file > BIG / 10) {
+        out.push(format!(
+            "ledger is {:.1} MB: run `hookwatch prune` in a terminal",
+            file as f64 / 1048576.0
+        ));
+    }
+    if s.open_proposals > 0 {
+        out.push(format!(
+            "{} open proposal(s): `hookwatch proposals`",
+            s.open_proposals
+        ));
+    }
+    if s.unlabelled_applied > 0 {
+        out.push(format!(
+            "{} verdict(s) acted on the agent without your label: `hookwatch why`, then `hookwatch override <id> --right|--wrong`",
+            s.unlabelled_applied
+        ));
+    }
+    Ok(out)
+}
+
+fn prune(days: i64) -> anyhow::Result<()> {
+    need_terminal("prune")?;
+    let l = ledger()?;
+    let path = home().join("ledger.db");
+    let size = |p: &std::path::Path| -> anyhow::Result<u64> {
+        Ok(std::fs::metadata(p).context("ledger.db")?.len())
+    };
+    let before = size(&path)?;
+    // A copy first: pruning drops data, and a bug in it must not cost the ledger.
+    let bak = path.with_extension(format!("db.bak.{}", now_ms()));
+    l.backup_to(&bak)?;
+    println!("backup: {}", bak.display());
+    let texts = l.all_texts()?;
+    let secrets = mask::find_secrets(&texts.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let now = now_ms();
+    let r = l.prune(now - days * 86_400_000, now, &|t: &str| {
+        mask::mask(t, &secrets)
+    })?;
+    l.vacuum()?;
+    println!(
+        "masked {} rows ({} secrets found by gitleaks), repaired {} broken rows, dropped {} tool outputs and {} snapshots older than {days} days",
+        r.redacted,
+        secrets.len(),
+        r.repaired,
+        r.outputs_dropped,
+        r.snapshots_emptied
+    );
+    println!(
+        "stored text {:.1} → {:.1} MB, file {:.1} → {:.1} MB",
+        r.bytes_before as f64 / 1048576.0,
+        r.bytes_after as f64 / 1048576.0,
+        before as f64 / 1048576.0,
+        size(&path)? as f64 / 1048576.0
+    );
+    Ok(())
+}
+
 /// Every recorded event, classified, ordered by session then time.
 fn load_evs(l: &Ledger) -> anyhow::Result<Vec<episode::Ev>> {
     let mut out = vec![];
@@ -352,9 +527,15 @@ fn load_evs(l: &Ledger) -> anyhow::Result<Vec<episode::Ev>> {
     Ok(out)
 }
 
-fn episodes(json: bool, last: usize, context: usize) -> anyhow::Result<()> {
+fn episodes(
+    json: bool,
+    last: usize,
+    context: usize,
+    repo: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     let l = ledger()?;
-    let all = episode::episodes(&load_evs(&l)?, &l.rework_rows()?, &l.label_rows()?, context);
+    let (evs, reworks, labels) = load_scoped(&l, repo)?;
+    let all = episode::episodes(&evs, &reworks, &labels, context);
     let eps = &all[all.len().saturating_sub(last)..];
     if json {
         println!("{}", serde_json::to_string_pretty(eps)?);
@@ -483,8 +664,9 @@ fn rule_places(repo: &std::path::Path) -> anyhow::Result<Vec<String>> {
 
 fn smith_input(last: usize, repo: &std::path::Path) -> anyhow::Result<()> {
     let l = ledger()?;
-    let evs = load_evs(&l)?;
-    let all = episode::episodes(&evs, &l.rework_rows()?, &l.label_rows()?, 5);
+    // Smith works on one repo: its sessions, and its rule files.
+    let (evs, reworks, labels) = load_scoped(&l, Some(repo))?;
+    let all = episode::episodes(&evs, &reworks, &labels, 5);
     let eps = &all[all.len().saturating_sub(last)..];
     let mut transcripts: std::collections::HashMap<String, Option<String>> = Default::default();
     let mut out_eps = vec![];
@@ -850,7 +1032,9 @@ fn read_if_exists(path: &str) -> anyhow::Result<Option<String>> {
     }
 }
 
-/// At Stop: keep the content of every file the agent edited in this turn.
+/// At Stop: keep the content of every file the agent edited in this turn,
+/// and mask credentials in the turn's events and those snapshots (one
+/// gitleaks run for the whole turn).
 fn take_snapshots(l: &Ledger, session: &str, ts: i64) -> anyhow::Result<()> {
     let mut paths = std::collections::BTreeSet::new();
     for p in l.post_tool_payloads_this_turn(session)? {
@@ -860,22 +1044,48 @@ fn take_snapshots(l: &Ledger, session: &str, ts: i64) -> anyhow::Result<()> {
             paths.insert(path);
         }
     }
+    let mut files = vec![];
     for path in paths {
         // A file the agent deleted has nothing to compare later.
         if let Some(content) = read_if_exists(&path)? {
-            l.put_snapshot(&new_id(), session, &path, ts, &content)?;
+            files.push((path, content));
         }
+    }
+    let turn = l.turn_rows(session)?;
+    let texts: Vec<&str> = turn
+        .iter()
+        .map(|(_, p)| p.as_str())
+        .chain(files.iter().map(|(_, c)| c.as_str()))
+        .collect();
+    let secrets = mask::find_secrets(&texts)?;
+    for (id, payload) in &turn {
+        let (masked, n) = mask::mask(payload, &secrets);
+        if n > 0 {
+            l.set_payload(id, &masked)?;
+        }
+    }
+    for (path, content) in files {
+        let (content, _) = mask::mask(&content, &secrets);
+        l.put_snapshot(&new_id(), session, &path, ts, &content)?;
     }
     Ok(())
 }
 
 /// At the next prompt (or session end): what did the human change since?
 fn check_rework(l: &Ledger, session: &str, ts: i64) -> anyhow::Result<()> {
-    for snap in l.open_snapshots(session)? {
-        let now = match read_if_exists(&snap.path)? {
+    let snaps = l.open_snapshots(session)?;
+    let mut nows = vec![];
+    for snap in &snaps {
+        nows.push(match read_if_exists(&snap.path)? {
             Some(s) => s,
             None => String::new(), // the human deleted it: every line removed
-        };
+        });
+    }
+    // The snapshots are stored masked; mask the files now the same way, so
+    // the diff compares like with like and carries no credential.
+    let secrets = mask::find_secrets(&nows.iter().map(String::as_str).collect::<Vec<_>>())?;
+    for (snap, now) in snaps.into_iter().zip(nows) {
+        let (now, _) = mask::mask(&now, &secrets);
         let diff = rework::diff_text(&snap.content, &now);
         // A pure move of lines has a diff but +0 -0; it is still the human's change.
         let found = if diff.is_empty() {
@@ -963,9 +1173,10 @@ fn why(id: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn stats() -> anyhow::Result<()> {
+fn stats(repo: Option<&std::path::Path>) -> anyhow::Result<()> {
     let l = ledger()?;
-    let stream: Vec<(String, i64, String)> = load_evs(&l)?
+    let (evs, reworks, _) = load_scoped(&l, repo)?;
+    let stream: Vec<(String, i64, String)> = evs
         .into_iter()
         .map(|e| (e.session, e.ts_ms, e.kind))
         .collect();
@@ -996,14 +1207,28 @@ fn stats() -> anyhow::Result<()> {
     println!("permission denied    {}", f.denied);
     println!("tool failures        {}", f.tool_failures);
     println!("stop failures        {}", f.stop_failures);
-    let r = l.rework_totals()?;
     let stops = f.by_event.get("Stop").copied().unwrap_or(0); // no Stop event yet
+    // One check (one prompt) closes every file of a turn at the same time.
+    let turns: std::collections::HashSet<(&str, i64)> = reworks
+        .iter()
+        .map(|r| (r.session.as_str(), r.ts_ms))
+        .collect();
     println!(
         "rework               {} of {} stopped turns, {} files, +{} -{} lines",
-        r.turns, stops, r.files, r.added, r.removed
+        turns.len(),
+        stops,
+        reworks.len(),
+        reworks.iter().map(|r| r.added).sum::<i64>(),
+        reworks.iter().map(|r| r.removed).sum::<i64>()
     );
-    for (path, a, d, t) in l.recent_rework(5)? {
-        println!("  {:>4} ago  +{a} -{d}  {path}", ago(t));
+    for r in reworks.iter().rev().take(5) {
+        println!(
+            "  {:>4} ago  +{} -{}  {}",
+            ago(r.ts_ms),
+            r.added,
+            r.removed,
+            r.path
+        );
     }
     println!(
         "events               {}",
