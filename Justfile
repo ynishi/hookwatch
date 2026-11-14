@@ -9,6 +9,7 @@ default:
 check:
     cargo fmt
     cargo test
+    python3 -m unittest discover -s jigs -p 'test_*.py'
 
 # books/ holds what must keep holding (whyshelf, qa-first). A change that makes
 # an approval stale is listed here: re-check that promise before approving again.

@@ -74,6 +74,11 @@ pub struct Draft {
     /// jig is retired and this one enters in shadow.
     #[serde(default)]
     pub replaces: Option<String>,
+    /// The scripts of a command jig (file name → text), taken by `propose`
+    /// when the gate ran them; `accept` writes these, so a script changed
+    /// after the gate is not what goes in effect. Smith does not write this.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scripts: std::collections::BTreeMap<String, String>,
 }
 
 /// The shape errors a draft can have. Checked before anything runs.
@@ -217,6 +222,7 @@ mod tests {
             lifecycle: Lifecycle::Shadow,
             message: "m".into(),
             when: Default::default(),
+            repeat: Default::default(),
         }
     }
 
@@ -240,6 +246,7 @@ mod tests {
             cases,
             changed_since: None,
             replaces: None,
+            scripts: Default::default(),
         }
     }
 

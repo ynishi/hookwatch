@@ -58,8 +58,6 @@ pub enum Rule {
     /// a Bash command that both names the path and looks like a write
     /// (`bash_writes`). Reading a protected path is not a hit.
     PathRegex { pattern: String },
-    /// An edit of a test that removes assertions or adds a skip marker.
-    TestWeakening,
     /// Any program (a Python script, a shell script, …) that hookwatch runs
     /// with the hook payload on stdin. Exit 0 = no hit, exit 2 = hit (stderr
     /// is the evidence), anything else or no exit within `timeout_ms` = the
@@ -143,11 +141,39 @@ pub struct Jig {
     /// measured 2026-11-14).
     #[serde(default, skip_serializing_if = "When::is_any")]
     pub when: When,
+    /// `once`: a hit whose evidence this jig already gave is not said again
+    /// (the run is still timed). For jigs that report a standing state, such
+    /// as the script bundles worth a tool, at every turn's end.
+    #[serde(default, skip_serializing_if = "Repeat::is_always")]
+    pub repeat: Repeat,
 }
 
-/// Empty fields match everything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Repeat {
+    #[default]
+    Always,
+    Once,
+}
+
+impl Repeat {
+    pub fn is_always(&self) -> bool {
+        *self == Repeat::Always
+    }
+}
+
+/// The time of the event a command jig is judging: now in the hook, the
+/// recorded time in a replay. Handed to the script as HOOKWATCH_EVENT_TS_MS,
+/// so a jig that reads the ledger sees it as it was then.
+pub static EVENT_TS_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Empty fields match everything, but for `events` (empty = PreToolUse).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct When {
+    /// Hook events, e.g. ["Stop"]. Empty: ["PreToolUse"]. Only command jigs
+    /// may name others, and only to nudge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
     /// Tool names, e.g. ["Write", "Edit"].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
@@ -158,13 +184,24 @@ pub struct When {
 
 impl When {
     pub fn is_any(&self) -> bool {
-        self.tools.is_empty() && self.path.is_none()
+        self.events.is_empty() && self.tools.is_empty() && self.path.is_none()
+    }
+
+    pub fn events(&self) -> Vec<String> {
+        if self.events.is_empty() {
+            vec!["PreToolUse".into()]
+        } else {
+            self.events.clone()
+        }
     }
 }
 
 /// The parts of a PreToolUse call the rules read.
 #[derive(Debug, Clone, Default)]
 pub struct ToolCall {
+    /// The hook event; "" reads as PreToolUse (what from_claude builds).
+    pub hook_event: String,
+    /// "" for an event without a tool (Stop, UserPromptSubmit, …).
     pub tool: String,
     pub command: Option<String>,
     pub path: Option<String>,
@@ -173,6 +210,32 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
+    pub fn event(&self) -> &str {
+        if self.hook_event.is_empty() {
+            "PreToolUse"
+        } else {
+            &self.hook_event
+        }
+    }
+
+    /// Any hook event, for command jigs: the tool fields when it has them
+    /// (PostToolUse), none otherwise. Edits are not read.
+    pub fn for_event(event: &str, tool: Option<&str>, input: Option<&serde_json::Value>) -> Self {
+        let s = |k: &str| {
+            input
+                .and_then(|v| v.get(k))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        };
+        ToolCall {
+            hook_event: event.to_owned(),
+            tool: tool.unwrap_or("").to_owned(),
+            command: s("command"),
+            path: s("file_path").or_else(|| s("notebook_path")),
+            edits: vec![],
+        }
+    }
+
     /// Build from Claude Code's `tool_name` / `tool_input`. `on_disk` is the
     /// current content of the target file for Write: `None` means the file
     /// does not exist yet (the caller tells that apart from a read error).
@@ -189,6 +252,7 @@ impl ToolCall {
             opt(v, k).ok_or_else(|| anyhow::anyhow!("{tool} tool_input has no string `{k}`"))
         }
         let mut call = ToolCall {
+            hook_event: String::new(),
             tool: tool.to_owned(),
             command: opt(input, "command"),
             path: opt(input, "file_path").or_else(|| opt(input, "notebook_path")),
@@ -238,12 +302,16 @@ pub struct Engine {
 }
 
 struct CompiledWhen {
+    events: Vec<String>,
     tools: Vec<String>,
     path: Option<Regex>,
 }
 
 impl CompiledWhen {
     fn matches(&self, call: &ToolCall) -> bool {
+        if !self.events.iter().any(|e| *e == call.event()) {
+            return false;
+        }
         let tool_ok = self.tools.is_empty() || self.tools.iter().any(|t| *t == call.tool);
         let path_ok = match (&self.path, &call.path) {
             (None, _) => true,
@@ -256,61 +324,7 @@ impl CompiledWhen {
 
 enum Compiled {
     Regex(Regex),
-    TestWeakening(TestPatterns),
     Command,
-}
-
-struct TestPatterns {
-    test_path: Regex,
-    inline_test: Regex,
-    assertion: Regex,
-    skip: Regex,
-}
-
-impl TestPatterns {
-    fn new() -> Self {
-        TestPatterns {
-            test_path: Regex::new(
-                r"(^|/)(tests?|__tests__|spec)/|_test\.(go|py|rs)$|\.(test|spec)\.[cm]?[jt]sx?$|(^|/)test_[^/]+\.py$",
-            )
-            .unwrap(),
-            inline_test: Regex::new(r"#\[test\]|#\[cfg\(test\)\]|#\[tokio::test").unwrap(),
-            assertion: Regex::new(
-                r"\bassert\w*!?\s*\(|\bassert\s|\bexpect\s*\(|\.to[A-Z]\w*\s*\(|\bself\.assert\w+\s*\(|\bt\.(Error|Fatal)\w*\s*\(|\brequire\.\w+\s*\(",
-            )
-            .unwrap(),
-            skip: Regex::new(
-                r"#\[ignore\]|@pytest\.mark\.(skip|xfail)|@unittest\.skip|\b(it|test|describe)\.(skip|todo)\s*\(|\bx(it|describe)\s*\(|\bt\.Skip\w*\s*\(|@Disabled\b|pytest\.skip\s*\(",
-            )
-            .unwrap(),
-        }
-    }
-
-    fn check(&self, call: &ToolCall) -> Option<String> {
-        let path = call.path.as_deref().unwrap_or("");
-        let mut out = vec![];
-        for (old, new) in &call.edits {
-            let is_test = self.test_path.is_match(path) || self.inline_test.is_match(old);
-            if !is_test {
-                continue;
-            }
-            let a_old = self.assertion.find_iter(old).count();
-            let a_new = self.assertion.find_iter(new).count();
-            let s_old = self.skip.find_iter(old).count();
-            let s_new = self.skip.find_iter(new).count();
-            if a_new < a_old {
-                out.push(format!("assertions {a_old} -> {a_new}"));
-            }
-            if s_new > s_old {
-                out.push(format!("skip markers {s_old} -> {s_new}"));
-            }
-        }
-        if out.is_empty() {
-            None
-        } else {
-            Some(out.join(", "))
-        }
-    }
 }
 
 impl Engine {
@@ -324,7 +338,6 @@ impl Engine {
                     Regex::new(pattern)
                         .map_err(|e| anyhow::anyhow!("jig {}: bad pattern: {e}", j.id))?,
                 ),
-                Rule::TestWeakening => Compiled::TestWeakening(TestPatterns::new()),
                 Rule::Command { argv, .. } => {
                     if argv.is_empty() {
                         anyhow::bail!("jig {}: command argv is empty", j.id);
@@ -332,7 +345,26 @@ impl Engine {
                     Compiled::Command
                 }
             };
+            let events = j.when.events();
+            if events.iter().any(|e| e != "PreToolUse") {
+                // Regex rules read a tool call; only a script can judge a
+                // turn's end or a result. And only a call not yet made can
+                // be stopped.
+                if !matches!(j.rule, Rule::Command { .. }) {
+                    anyhow::bail!(
+                        "jig {}: only a command jig can watch events other than PreToolUse",
+                        j.id
+                    );
+                }
+                if j.action == Action::Block {
+                    anyhow::bail!(
+                        "jig {}: a block can only act on PreToolUse; use nudge",
+                        j.id
+                    );
+                }
+            }
             let w = CompiledWhen {
+                events,
                 tools: j.when.tools.clone(),
                 path: match &j.when.path {
                     Some(p) => Some(
@@ -345,6 +377,10 @@ impl Engine {
             out.push((j, c, w));
         }
         Ok(Engine { jigs: out })
+    }
+
+    pub fn jigs_all(&self) -> impl Iterator<Item = &Jig> {
+        self.jigs.iter().map(|(j, _, _)| j)
     }
 
     #[cfg(test)]
@@ -414,12 +450,12 @@ impl Engine {
                         }
                     })
                 }
-                (Rule::TestWeakening, Compiled::TestWeakening(tp)) => tp.check(call),
                 _ => unreachable!("rule and compiled form are built together"),
             };
             if let Some(evidence) = evidence {
                 let at = match &call.path {
                     Some(p) => format!("{} {p}", call.tool),
+                    None if call.tool.is_empty() => call.event().to_owned(),
                     None => call.tool.clone(),
                 };
                 hits.push(Hit {
@@ -527,6 +563,7 @@ pub fn builtin() -> Vec<Jig> {
         lifecycle,
         message: message.into(),
         when: When::default(),
+        repeat: Repeat::Always,
     };
     vec![
         j(
@@ -558,14 +595,6 @@ pub fn builtin() -> Vec<Jig> {
             Action::Block,
             Lifecycle::Enforce,
             "Hook settings and hookwatch's state are changed by the human, not by the agent.",
-        ),
-        j(
-            "test-weakening",
-            "an edit of a test that removes assertions or adds skip / ignore",
-            Rule::TestWeakening,
-            Action::Block,
-            Lifecycle::Shadow,
-            "This edit weakens a test (fewer assertions or a new skip). Fix the code under test, not the test.",
         ),
     ]
 }
@@ -621,63 +650,41 @@ mod tests {
         assert!(e.evaluate(&c).is_empty());
     }
 
+    // test-weakening moved to jigs/tests_weakened.py (its tests are there).
+
     #[test]
-    fn test_weakening_sees_removed_assertion_and_new_ignore() {
-        let e = engine();
-        let c = ToolCall::from_claude(
-            "Edit",
-            &json!({
-                "file_path": "/r/src/lib.rs",
-                "old_string": "#[test]\nfn a() { assert_eq!(f(), 1); assert!(g()); }",
-                "new_string": "#[test]\n#[ignore]\nfn a() { assert!(g()); }"
-            }),
-            None,
-        )
-        .unwrap();
-        let h = e.evaluate(&c);
-        assert_eq!(ids(&h), vec!["test-weakening"]);
-        assert!(
-            h[0].evidence.contains("assertions 2 -> 1"),
-            "{}",
-            h[0].evidence
-        );
-        assert!(
-            h[0].evidence.contains("skip markers 0 -> 1"),
-            "{}",
-            h[0].evidence
-        );
-        assert_eq!(h[0].lifecycle, Lifecycle::Shadow);
+    fn event_scoped_command_jig_runs_only_on_its_event() {
+        let mut j = cmd_jig("stop");
+        j.action = Action::Nudge;
+        j.when.events = vec!["Stop".into()];
+        let e = Engine::new(vec![j]).unwrap();
+        let mut started = 0;
+        let mut run = |_: &[String], _: &str, _: u64| {
+            started += 1;
+            Ok(RunResult {
+                exit: Some(2),
+                stderr: "candidates: a".into(),
+                ms: 1,
+            })
+        };
+        assert!(e.evaluate_with(&bash("ls"), "{}", &mut run).hits.is_empty());
+        let stop = ToolCall::for_event("Stop", None, None);
+        let ev = e.evaluate_with(&stop, "{}", &mut run);
+        assert_eq!(ids(&ev.hits), vec!["stop"]);
+        assert_eq!(ev.hits[0].evidence, "Stop: candidates: a");
+        assert_eq!(started, 1);
     }
 
     #[test]
-    fn test_weakening_ignores_non_test_code_and_added_assertions() {
-        let e = engine();
-        let c = ToolCall::from_claude(
-            "Edit",
-            &json!({"file_path": "/r/src/lib.rs", "old_string": "assert!(x);", "new_string": ""}),
-            None,
-        )
+    fn other_events_are_for_command_nudges_only() {
+        let mut block = cmd_jig("b");
+        block.when.events = vec!["Stop".into()];
+        assert!(Engine::new(vec![block]).is_err()); // cmd_jig blocks
+        let f: JigFile = serde_json::from_value(json!({"jigs": [{
+            "id": "r", "description": "", "rule": {"kind": "bash_regex", "pattern": "x"},
+            "action": "nudge", "lifecycle": "shadow", "message": "m", "when": {"events": ["PostToolUse"]}}]}))
         .unwrap();
-        assert!(e.evaluate(&c).is_empty());
-        let c = ToolCall::from_claude(
-            "Edit",
-            &json!({"file_path": "/r/tests/a.rs", "old_string": "assert!(x);", "new_string": "assert!(x); assert!(y);"}),
-            None,
-        )
-        .unwrap();
-        assert!(e.evaluate(&c).is_empty());
-    }
-
-    #[test]
-    fn write_compares_with_file_on_disk() {
-        let e = engine();
-        let c = ToolCall::from_claude(
-            "Write",
-            &json!({"file_path": "/r/foo.test.ts", "content": "it('a', () => {})"}),
-            Some("it('a', () => { expect(a).toBe(1) })".into()),
-        )
-        .unwrap();
-        assert_eq!(ids(&e.evaluate(&c)), vec!["test-weakening"]);
+        assert!(Engine::new(f.jigs).is_err());
     }
 
     #[test]
@@ -786,6 +793,7 @@ mod tests {
             lifecycle: Lifecycle::Shadow,
             message: "m".into(),
             when: When::default(),
+            repeat: Repeat::Always,
         }
     }
 
@@ -794,6 +802,7 @@ mod tests {
     fn when_skips_calls_before_the_rule_runs() {
         let mut j = cmd_jig("md-only");
         j.when = When {
+            events: vec![],
             tools: vec!["Write".into(), "Edit".into()],
             path: Some(r"\.md$".into()),
         };
@@ -913,7 +922,7 @@ mod tests {
     #[test]
     fn file_overrides_lifecycle_and_adds_jigs() {
         let f: JigFile = serde_json::from_value(json!({
-            "lifecycle": {"test-weakening": "enforce", "no-verify": "retired"},
+            "lifecycle": {"tamper-guard": "shadow", "no-verify": "retired"},
             "jigs": [{"id": "no-force-push", "description": "", "rule": {"kind": "bash_regex", "pattern": "push\\s+.*--force"},
                       "action": "nudge", "lifecycle": "enforce", "message": "m"}]
         }))
@@ -926,7 +935,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ids(&e.evaluate(&c)), vec!["no-force-push"]);
-        let tw = e.jigs().find(|j| j.id == "test-weakening").unwrap();
-        assert_eq!(tw.lifecycle, Lifecycle::Enforce);
+        let tg = e.jigs().find(|j| j.id == "tamper-guard").unwrap();
+        assert_eq!(tg.lifecycle, Lifecycle::Shadow);
     }
 }

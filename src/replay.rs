@@ -64,7 +64,47 @@ pub fn run(engine: &Engine, events: &[Ev], run: &mut Runner) -> Report {
     };
     let mut by_jig: BTreeMap<String, JigReplay> = BTreeMap::new();
     for (i, e) in events.iter().enumerate() {
+        crate::jig::EVENT_TS_MS.store(e.ts_ms, std::sync::atomic::Ordering::Relaxed);
+        let hook_event = e
+            .payload
+            .get("hook_event_name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
         if e.kind != "PreToolUse" {
+            // Other events reach only command jigs that name them; nothing
+            // was stopped there, so a hit's outcome is just "event".
+            if hook_event.is_empty() || hook_event == "PreToolUse" {
+                continue;
+            }
+            let call =
+                ToolCall::for_event(hook_event, e.tool.as_deref(), e.payload.get("tool_input"));
+            let evaluation = engine.evaluate_with(&call, &e.payload.to_string(), run);
+            for r in evaluation.runs {
+                report.command_runs += 1;
+                if let RunOutcome::Error(m) = r.outcome {
+                    report.command_errors.push(format!("{}: {m}", r.jig_id));
+                }
+            }
+            for h in evaluation.hits {
+                let r = by_jig.entry(h.jig_id.clone()).or_insert_with(|| JigReplay {
+                    jig: h.jig_id.clone(),
+                    hits: 0,
+                    outcomes: BTreeMap::new(),
+                    samples: vec![],
+                    all: vec![],
+                });
+                r.hits += 1;
+                *r.outcomes.entry("event").or_insert(0) += 1;
+                if r.samples.len() < 3 {
+                    r.samples.push(format!("event | {}", h.evidence));
+                }
+                r.all.push((
+                    "event",
+                    hook_event.to_owned(),
+                    serde_json::Value::Null,
+                    h.evidence.clone(),
+                ));
+            }
             continue;
         }
         report.calls += 1;
@@ -174,6 +214,7 @@ mod tests {
             lifecycle: Lifecycle::Shadow,
             message: String::new(),
             when: Default::default(),
+            repeat: Default::default(),
         };
         let engine = Engine::new(vec![jig]).unwrap();
         let events = vec![

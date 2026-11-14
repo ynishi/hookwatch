@@ -48,7 +48,12 @@ plugin の hooks は `plugin/scripts/hook.sh` を経て `hookwatch hook` を呼�
 | no-verify | enforce | git の hook を飛ばす `--no-verify` |
 | secret-in-file | enforce | 秘密鍵や cloud の credential を file に書くこと |
 | tamper-guard | enforce | hook の設定と hookwatch 自身の状態への書き込み (読むのは止めない) |
-| test-weakening | shadow | test の assert を減らす、skip を足す編集 |
+
+## Rust と script の分け方
+
+- hookwatch (Rust) が持つのは仕組みだけ: 記録、手直しの計測、治具の起動と時間の計測、Shadow / enforce、replay、決める者の確認
+- 何を当たりとするかは治具 (`jigs/` の Python script) に置く。例: `jigs/tests_weakened.py` (test の assert を減らす編集)、`jigs/hotspots.py` (何度も書いて回した script を、ターンの終わりに正式な道具の候補として知らせる)。書き方は [docs/jig-authoring.md](docs/jig-authoring.md)
+- 効いている治具の script は `$HOME/.hookwatch/jigs/` の写しだけが動く (`just jigs` か `accept` が写す)。提案の accept / reject は、人か、人が `$HOME/.hookwatch/deciders.json` に書いた役の agent (`hookwatch:jig-judge`) が行う。label・put-jigs・prune は人だけ
 
 ## Rework の数え方
 

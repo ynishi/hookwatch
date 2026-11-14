@@ -47,6 +47,51 @@
         ],
         "path": "\\.md$"
       }
+    },
+    {
+      "id": "test-weakening",
+      "description": "an edit of a test that removes assertions or adds skip / ignore",
+      "rule": {
+        "kind": "command",
+        "argv": [
+          "python3",
+          "-I",
+          "$HOME/projects/hookwatch/jigs/tests_weakened.py"
+        ],
+        "timeout_ms": 2000
+      },
+      "action": "block",
+      "lifecycle": "shadow",
+      "message": "This edit weakens a test (fewer assertions or a new skip). Fix the code under test, not the test.",
+      "when": {
+        "tools": [
+          "Write",
+          "Edit",
+          "MultiEdit"
+        ]
+      }
+    },
+    {
+      "id": "hotspots",
+      "description": "scripts written and run again and again: candidates for a canonical tool",
+      "rule": {
+        "kind": "command",
+        "argv": [
+          "python3",
+          "-I",
+          "$HOME/projects/hookwatch/jigs/hotspots.py"
+        ],
+        "timeout_ms": 5000
+      },
+      "action": "nudge",
+      "lifecycle": "shadow",
+      "message": "These scripts keep being written and run: make each a canonical tool (tools/ + test) or say why not",
+      "when": {
+        "events": [
+          "Stop"
+        ]
+      },
+      "repeat": "once"
     }
   ],
   "lifecycle": {

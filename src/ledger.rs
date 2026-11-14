@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS snapshots (
   id TEXT PRIMARY KEY, session TEXT NOT NULL, path TEXT NOT NULL, ts_ms INTEGER NOT NULL,
   content TEXT NOT NULL, checked INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS snapshots_open ON snapshots(session, checked);
+-- A role agent may run a deciding command (accept / reject) once: the hook
+-- writes the grant when it sees that agent's call, from the agent_type
+-- Claude Code puts in the hook input (not from anything the agent says),
+-- and the command uses it up.
+CREATE TABLE IF NOT EXISTS grants (
+  id TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL, op TEXT NOT NULL, target TEXT NOT NULL,
+  agent_type TEXT NOT NULL, agent_id TEXT, used_ts_ms INTEGER);
 -- Small facts about the ledger itself (e.g. when it was last pruned).
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 -- Proposals from Jig Smith. Kept when rejected, so the same idea is not
@@ -82,7 +89,8 @@ CREATE TABLE IF NOT EXISTS proposals (
   id TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL, intent TEXT NOT NULL, outlet TEXT NOT NULL,
   draft TEXT NOT NULL, gate TEXT,
   status TEXT NOT NULL CHECK (status IN ('open','accepted','rejected','retired')),
-  decided_by TEXT CHECK (decided_by IN ('gate','human')), why TEXT, decided_ts_ms INTEGER);
+  decided_by TEXT, why TEXT, decided_ts_ms INTEGER);
+-- decided_by: 'gate', 'human', or 'agent:<agent_type>'.
 -- Every run of a command jig: hookwatch's stopwatch on the jigs themselves.
 CREATE TABLE IF NOT EXISTS jig_runs (
   id TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL, event_id TEXT NOT NULL REFERENCES events(id),
@@ -217,6 +225,26 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     )?;
     if !has_diff {
         conn.execute("ALTER TABLE rework ADD COLUMN diff TEXT", [])?;
+    }
+    // decided_by was limited to gate / human; a role agent decides too now.
+    let old_check: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE name = 'proposals' AND sql LIKE '%decided_by IN%'",
+        [],
+        |r| r.get(0),
+    )?;
+    if old_check {
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE proposals RENAME TO proposals_old;
+             CREATE TABLE proposals (
+               id TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL, intent TEXT NOT NULL, outlet TEXT NOT NULL,
+               draft TEXT NOT NULL, gate TEXT,
+               status TEXT NOT NULL CHECK (status IN ('open','accepted','rejected','retired')),
+               decided_by TEXT, why TEXT, decided_ts_ms INTEGER);
+             INSERT INTO proposals SELECT * FROM proposals_old;
+             DROP TABLE proposals_old;
+             COMMIT;",
+        )?;
     }
     Ok(())
 }
@@ -584,6 +612,59 @@ impl Ledger {
         )?)
     }
 
+    /// Whether this jig already gave this evidence (for `repeat: once`).
+    pub fn has_verdict(&self, jig: &str, evidence: &str) -> anyhow::Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM verdicts WHERE jig = ?1 AND evidence = ?2",
+            params![jig, evidence],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn add_grant(
+        &self,
+        id: &str,
+        ts_ms: i64,
+        op: &str,
+        target: &str,
+        agent_type: &str,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO grants (id, ts_ms, op, target, agent_type, agent_id) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![id, ts_ms, op, target, agent_type, agent_id],
+        )?;
+        Ok(())
+    }
+
+    /// Use up the newest unused grant for (op, target) younger than
+    /// `max_age_ms`; its agent_type, or None.
+    pub fn take_grant(
+        &self,
+        op: &str,
+        target: &str,
+        now_ms: i64,
+        max_age_ms: i64,
+    ) -> anyhow::Result<Option<String>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, agent_type FROM grants WHERE op = ?1 AND target = ?2
+                 AND used_ts_ms IS NULL AND ts_ms >= ?3 ORDER BY ts_ms DESC LIMIT 1",
+                params![op, target, now_ms - max_age_ms],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, agent_type)) = row else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            "UPDATE grants SET used_ts_ms = ?2 WHERE id = ?1",
+            params![id, now_ms],
+        )?;
+        Ok(Some(agent_type))
+    }
+
     /// (tool_name, tool_input) of every call whose verdict the human last
     /// labelled right: hits a human has confirmed.
     pub fn right_labelled_calls(&self) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
@@ -612,11 +693,12 @@ impl Ledger {
         status: &str,
         why: Option<&str>,
         ts_ms: i64,
+        by: &str,
     ) -> anyhow::Result<()> {
         let n = self.conn.execute(
-            "UPDATE proposals SET status = ?2, decided_by = 'human', why = ?3, decided_ts_ms = ?4
+            "UPDATE proposals SET status = ?2, decided_by = ?5, why = ?3, decided_ts_ms = ?4
              WHERE id = ?1 AND status = 'open'",
-            params![id, status, why, ts_ms],
+            params![id, status, why, ts_ms, by],
         )?;
         if n != 1 {
             anyhow::bail!("proposal {id} is not open");
@@ -1005,6 +1087,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_grant_is_used_once_and_only_while_fresh() {
+        let l = Ledger::in_memory().unwrap();
+        l.add_grant("g1", 1_000, "accept", "abc", "hookwatch:jig-judge", None)
+            .unwrap();
+        assert_eq!(
+            l.take_grant("accept", "abc", 200_000, 60_000).unwrap(),
+            None
+        ); // stale
+        l.add_grant("g2", 100_000, "accept", "abc", "hookwatch:jig-judge", None)
+            .unwrap();
+        assert_eq!(
+            l.take_grant("reject", "abc", 100_500, 60_000).unwrap(),
+            None
+        );
+        assert_eq!(
+            l.take_grant("accept", "abc", 100_500, 60_000)
+                .unwrap()
+                .as_deref(),
+            Some("hookwatch:jig-judge")
+        );
+        assert_eq!(
+            l.take_grant("accept", "abc", 100_600, 60_000).unwrap(),
+            None
+        ); // used
+    }
+
+    #[test]
+    fn old_proposals_table_is_rebuilt_to_take_an_agent_decider() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE proposals (
+               id TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL, intent TEXT NOT NULL, outlet TEXT NOT NULL,
+               draft TEXT NOT NULL, gate TEXT,
+               status TEXT NOT NULL CHECK (status IN ('open','accepted','rejected','retired')),
+               decided_by TEXT CHECK (decided_by IN ('gate','human')), why TEXT, decided_ts_ms INTEGER);
+             INSERT INTO proposals VALUES ('p1', 1, 'i', 'jig', '{}', NULL, 'open', NULL, NULL, NULL);",
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
+        let l = Ledger { conn };
+        l.decide_proposal("p1", "accepted", None, 2, "agent:hookwatch:jig-judge")
+            .unwrap();
+        assert_eq!(
+            l.proposal_by_short("p1").unwrap().decided_by.as_deref(),
+            Some("agent:hookwatch:jig-judge")
+        );
+    }
+
     /// The rows the regex masking of 2026-11-14 cut: prune makes them
     /// readable again and says the payload was lost.
     #[test]
@@ -1057,10 +1189,14 @@ mod tests {
             vec!["rejected", "open"]
         );
         assert_eq!(all[0].decided_by.as_deref(), Some("gate"));
-        assert!(l.decide_proposal("p2", "accepted", None, 3).is_err());
-        l.decide_proposal("p1", "accepted", None, 3).unwrap();
         assert!(
-            l.decide_proposal("p1", "rejected", Some("again"), 4)
+            l.decide_proposal("p2", "accepted", None, 3, "human")
+                .is_err()
+        );
+        l.decide_proposal("p1", "accepted", None, 3, "human")
+            .unwrap();
+        assert!(
+            l.decide_proposal("p1", "rejected", Some("again"), 4, "human")
                 .is_err()
         );
         assert_eq!(

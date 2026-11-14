@@ -5,7 +5,9 @@ description: hookwatch が記録した人の摩擦 (割り込み、手直し、�
 
 # jig-smith
 
-人の摩擦から、治具か規則の提案を 1 つ作る。hookwatch は材料を渡し、提案を検査し、人の判断を記録する。提案は、人が accept するまで何も変えない。
+人の摩擦から、治具か規則の提案を 1 つ作る。hookwatch は材料を渡し、提案を検査し、人の判断を記録する。提案は、accept されるまで何も変えない。accept するのは人か、人が deciders.json に書いた役の agent (`hookwatch:jig-judge`)。Smith 自身は決めない。
+
+判断を script で書く治具 (command) は、script を repo の `jigs/` に置き、`jigs/test_<名前>.py` に unittest を付けてから propose する。propose が script の本文を提案に取り込み、accept がそれを `$HOME/.hookwatch/jigs/` に写す。書き方は `docs/jig-authoring.md`。
 
 ## 手順
 
@@ -13,7 +15,7 @@ description: hookwatch が記録した人の摩擦 (割り込み、手直し、�
 2. 同じ意図の episode をまとめ、意図・範囲・出口を決める (下の「判断」)
 3. proposal の JSON を session の scratchpad に書き、`hookwatch propose <file> --dry-run` で gate を見る。落ちたら規則か cases を直す。直せない時は、落ちたまま `propose` して理由を残す
 4. `hookwatch propose <file>` で置く
-5. 報告: 提案の id、意図、出口と理由、gate の結果。accept / reject は人が Claude Code の外の端末で行う (agent からは通らない)
+5. 報告: 提案の id、意図、出口と理由、gate の結果。accept / reject は人 (Claude Code の外の端末) か、agent `hookwatch:jig-judge` に提案の id だけを渡して任せる (Smith や作業中の agent が打っても通らない)
 
 提案は 1 回に 1 つ。人の言葉と差分に無い意図を足さない。
 

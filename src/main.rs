@@ -79,9 +79,24 @@ enum Cmd {
         /// Only these events (comma separated), e.g. UserPromptSubmit,Stop.
         #[arg(long, value_delimiter = ',')]
         kinds: Vec<String>,
-        /// How many of the newest events to show.
-        #[arg(long, default_value_t = 50)]
-        last: i64,
+        /// How many of the newest events to show (default: 50; with --json, all).
+        #[arg(long)]
+        last: Option<usize>,
+        /// One JSON object per line: {ts_ms, session, kind, tool, payload}.
+        /// This is what script jigs read; `kind` is the event as hookwatch
+        /// classifies it (as in `stats`), and --kinds then filters on it.
+        #[arg(long)]
+        json: bool,
+        /// With --json: only sessions that worked in this repo.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// With --json: only these tools (comma separated).
+        #[arg(long, value_delimiter = ',')]
+        tool: Vec<String>,
+        /// With --json: only events at or before this time (a replayed jig
+        /// sees the ledger as it was).
+        #[arg(long)]
+        until_ms: Option<i64>,
     },
     /// Frictions with what led to them (the human's goal, the agent's last
     /// tool calls): the material for writing a jig.
@@ -217,7 +232,17 @@ fn main() -> anyhow::Result<()> {
             session,
             kinds,
             last,
-        } => events(session, &kinds, last),
+            json,
+            repo,
+            tool,
+            until_ms,
+        } => {
+            if json {
+                events_json(session, &kinds, last, repo.as_deref(), &tool, until_ms)
+            } else {
+                events(session, &kinds, last.unwrap_or(50) as i64)
+            }
+        }
         Cmd::Episodes {
             json,
             last,
@@ -231,11 +256,11 @@ fn main() -> anyhow::Result<()> {
         Cmd::Accept { id } => accept(&id),
         Cmd::PutJigs { file } => put_jigs(&file),
         Cmd::Reject { id, why } => {
-            need_terminal("reject")?;
+            let by = decider("reject", &id)?;
             let l = ledger()?;
             let p = l.proposal_by_short(&id)?;
-            l.decide_proposal(&p.id, "rejected", Some(&why), now_ms())?;
-            println!("rejected {} ({})", short(&p.id), p.intent);
+            l.decide_proposal(&p.id, "rejected", Some(&why), now_ms(), &by)?;
+            println!("rejected {} ({}) by {by}", short(&p.id), p.intent);
             Ok(())
         }
         Cmd::Jigs => {
@@ -283,43 +308,62 @@ fn hook() -> anyhow::Result<i32> {
         "UserPromptSubmit" | "SessionEnd" => check_rework(&l, session, ts)?,
         _ => {}
     }
+    // What the human (not the agent) is told this event: `systemMessage`.
+    let mut for_human: Vec<String> = vec![];
     if event == "SessionStart" {
-        // Tell the human (not the agent) what waits for them, only when
-        // something does. `systemMessage` is shown to the user.
+        // Only when something waits for them.
         let lines = status_lines(&l, false)?;
         if !lines.is_empty() {
-            let msg = format!("hookwatch: {}", lines.join(" / "));
-            println!("{}", serde_json::json!({ "systemMessage": msg }));
+            for_human.push(format!("hookwatch: {}", lines.join(" / ")));
         }
-        return Ok(0);
     }
-    if event != "PreToolUse" {
-        return Ok(0);
+    if event == "PreToolUse"
+        && tool == Some("Bash")
+        && let Some(cmd) = v.pointer("/tool_input/command").and_then(|c| c.as_str())
+    {
+        note_grant(&l, &v, cmd, ts)?;
     }
-    let tool = tool.context("PreToolUse input has no tool_name")?;
-    let input = v
-        .get("tool_input")
-        .context("PreToolUse input has no tool_input")?;
-    let on_disk = if tool == "Write" {
-        let p = input
-            .get("file_path")
-            .and_then(|x| x.as_str())
-            .context("Write has no file_path")?;
-        match std::fs::read_to_string(p) {
-            Ok(s) => Some(s),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e).with_context(|| format!("read {p}")),
-        }
+    let call = if event == "PreToolUse" {
+        let tool = tool.context("PreToolUse input has no tool_name")?;
+        let input = v
+            .get("tool_input")
+            .context("PreToolUse input has no tool_input")?;
+        let on_disk = if tool == "Write" {
+            let p = input
+                .get("file_path")
+                .and_then(|x| x.as_str())
+                .context("Write has no file_path")?;
+            match std::fs::read_to_string(p) {
+                Ok(s) => Some(s),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e).with_context(|| format!("read {p}")),
+            }
+        } else {
+            None
+        };
+        ToolCall::from_claude(tool, input, on_disk)?
     } else {
-        None
+        ToolCall::for_event(event, tool, v.get("tool_input"))
     };
-    let call = ToolCall::from_claude(tool, input, on_disk)?;
     let engine = Engine::new(load_jigs()?)?;
+    jig::EVENT_TS_MS.store(ts, std::sync::atomic::Ordering::Relaxed);
     let evaluation = engine.evaluate_with(&call, &raw, &mut spawn_jig);
     for r in &evaluation.runs {
         l.add_run(&new_id(), ts, &event_id, r)?;
     }
-    let hits = evaluation.hits;
+    let once: std::collections::HashSet<String> = engine
+        .jigs_all()
+        .filter(|j| j.repeat == jig::Repeat::Once)
+        .map(|j| j.id.clone())
+        .collect();
+    let mut hits = vec![];
+    for h in evaluation.hits {
+        // A standing state (the same evidence again) is said once.
+        if once.contains(&h.jig_id) && l.has_verdict(&h.jig_id, &h.evidence)? {
+            continue;
+        }
+        hits.push(h);
+    }
 
     let mut block: Option<String> = None;
     let mut nudges: Vec<String> = vec![];
@@ -356,14 +400,30 @@ fn hook() -> anyhow::Result<i32> {
         }
     }
     if let Some(text) = block {
+        // Engine::new lets a block act on PreToolUse only.
         eprintln!("{text}");
         return Ok(2);
     }
+    let mut out = serde_json::Map::new();
     if !nudges.is_empty() {
-        let out = serde_json::json!({
-            "hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": nudges.join("\n")}
-        });
-        println!("{out}");
+        match event {
+            // These events take context for the agent.
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "UserPromptSubmit" => {
+                out.insert(
+                    "hookSpecificOutput".into(),
+                    serde_json::json!({"hookEventName": event, "additionalContext": nudges.join("\n")}),
+                );
+            }
+            // A turn's end, a session's start: tell the human; the agent
+            // is not made to go on.
+            _ => for_human.extend(nudges),
+        }
+    }
+    if !for_human.is_empty() {
+        out.insert("systemMessage".into(), for_human.join("\n").into());
+    }
+    if !out.is_empty() {
+        println!("{}", serde_json::Value::Object(out));
     }
     Ok(0)
 }
@@ -379,6 +439,38 @@ fn events(session: Option<String>, kinds: &[String], last: i64) -> anyhow::Resul
             &e.session[..e.session.len().min(8)],
             e.event,
             episode::summary(&e.event, e.tool.as_deref(), &p, 70)
+        );
+    }
+    Ok(())
+}
+
+/// The ledger as JSON Lines, for script jigs. Oldest first.
+fn events_json(
+    session: Option<String>,
+    kinds: &[String],
+    last: Option<usize>,
+    repo: Option<&std::path::Path>,
+    tools: &[String],
+    until_ms: Option<i64>,
+) -> anyhow::Result<()> {
+    let l = ledger()?;
+    let (evs, _, _) = load_scoped(&l, repo)?;
+    let keep: Vec<&episode::Ev> = evs
+        .iter()
+        .filter(|e| session.as_deref().is_none_or(|s| e.session.starts_with(s)))
+        .filter(|e| kinds.is_empty() || kinds.contains(&e.kind))
+        .filter(|e| tools.is_empty() || e.tool.as_ref().is_some_and(|t| tools.contains(t)))
+        .filter(|e| until_ms.is_none_or(|u| e.ts_ms <= u))
+        .collect();
+    // load_scoped orders by session then time; a reader wants time.
+    let mut keep = keep;
+    keep.sort_by_key(|e| e.ts_ms);
+    let skip = last.map_or(0, |n| keep.len().saturating_sub(n));
+    for e in &keep[skip..] {
+        println!(
+            "{}",
+            serde_json::json!({"ts_ms": e.ts_ms, "session": e.session, "kind": e.kind,
+                   "tool": e.tool, "payload": e.payload})
         );
     }
     Ok(())
@@ -584,6 +676,145 @@ fn prune(days: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Who may decide what. Kept by the human in $HOOKWATCH_HOME/deciders.json:
+/// `{"accept": ["hookwatch:jig-judge"], "reject": ["hookwatch:jig-judge"]}`
+/// (agent types, as Claude Code names them in the hook input). Ops not
+/// listed, and labels, put-jigs and prune, are the human's only.
+#[derive(Debug, Default, serde::Deserialize)]
+struct Deciders {
+    #[serde(default)]
+    accept: Vec<String>,
+    #[serde(default)]
+    reject: Vec<String>,
+}
+
+fn deciders() -> anyhow::Result<Deciders> {
+    let p = home().join("deciders.json");
+    match std::fs::read_to_string(&p) {
+        Ok(s) => serde_json::from_str(&s).with_context(|| format!("parse {}", p.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Deciders::default()),
+        Err(e) => Err(e).with_context(|| format!("read {}", p.display())),
+    }
+}
+
+/// How long a grant waits for its command (the hook runs just before it).
+const GRANT_MS: i64 = 60_000;
+
+/// At PreToolUse: when a role agent named in deciders.json runs
+/// `hookwatch accept|reject <id>`, leave it a one-time grant. The agent type
+/// comes from Claude Code's hook input; the main agent has none.
+fn note_grant(l: &Ledger, v: &serde_json::Value, cmd: &str, ts: i64) -> anyhow::Result<()> {
+    use std::sync::LazyLock;
+    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^\s*(?:\S*/)?hookwatch\s+(accept|reject)\s+([0-9a-f-]+)\b").unwrap()
+    });
+    let Some(c) = RE.captures(cmd) else {
+        return Ok(());
+    };
+    let Some(agent_type) = v.get("agent_type").and_then(|x| x.as_str()) else {
+        return Ok(()); // the main agent: no role
+    };
+    let d = deciders()?;
+    let allowed = match &c[1] {
+        "accept" => &d.accept,
+        _ => &d.reject,
+    };
+    if allowed.iter().any(|a| a == agent_type) {
+        let agent_id = v.get("agent_id").and_then(|x| x.as_str());
+        l.add_grant(&new_id(), ts, &c[1], &c[2], agent_type, agent_id)?;
+    }
+    Ok(())
+}
+
+/// Who runs this deciding command: "human" at a terminal, else
+/// "agent:<type>" when the hook left that role agent a grant for it.
+fn decider(op: &str, target: &str) -> anyhow::Result<String> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return Ok("human".into());
+    }
+    // Do not create a ledger for an agent that has no grant anyway.
+    if !home().join("ledger.db").exists() {
+        anyhow::bail!("{op} needs a terminal, or a role agent with a grant (deciders.json)");
+    }
+    match ledger()?.take_grant(op, target, now_ms(), GRANT_MS)? {
+        Some(t) => Ok(format!("agent:{t}")),
+        None => {
+            anyhow::bail!("{op} needs a terminal, or a role agent with a grant (deciders.json)")
+        }
+    }
+}
+
+/// Where the scripts of jigs in effect live: under hookwatch's own state,
+/// which tamper-guard keeps the agent from writing.
+fn jig_dir(id: &str) -> PathBuf {
+    home().join("jigs").join(id)
+}
+
+/// The script files a command jig names (argv entries that are files).
+fn script_args(argv: &[String]) -> anyhow::Result<Vec<(usize, PathBuf)>> {
+    let h = std::env::var("HOME").context("HOME is not set")?;
+    Ok(argv
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, a)| !a.starts_with('-'))
+        .map(|(i, a)| (i, PathBuf::from(jig::expand_home(a, &h))))
+        .filter(|(_, p)| p.is_file())
+        .collect())
+}
+
+/// Read a command jig's scripts and point its argv at their protected
+/// place: (file name → text). The caller writes them with `place_scripts`.
+fn take_scripts(jig: &mut jig::Jig) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    let jig::Rule::Command { argv, .. } = &mut jig.rule else {
+        return Ok(out);
+    };
+    for (i, p) in script_args(argv)? {
+        let name = p
+            .file_name()
+            .context("script path has no file name")?
+            .to_string_lossy()
+            .into_owned();
+        let text = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+        out.insert(name.clone(), text);
+        argv[i] = home_arg(&jig_dir(&jig.id).join(&name))?;
+    }
+    Ok(out)
+}
+
+/// `path` as an argv entry: `$HOME/...` when it is under $HOME (works on
+/// any machine), else as it is (a HOOKWATCH_HOME elsewhere).
+fn home_arg(path: &std::path::Path) -> anyhow::Result<String> {
+    let h = std::env::var("HOME").context("HOME is not set")?;
+    Ok(match path.strip_prefix(&h) {
+        Ok(rel) => format!("$HOME/{}", rel.to_string_lossy()),
+        Err(_) => path.to_string_lossy().into_owned(),
+    })
+}
+
+fn place_scripts(
+    id: &str,
+    scripts: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    if scripts.is_empty() {
+        return Ok(());
+    }
+    let dir = jig_dir(id);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    for (name, text) in scripts {
+        let p = dir.join(name);
+        std::fs::write(&p, text).with_context(|| format!("write {}", p.display()))?;
+        println!("placed {}", p.display());
+    }
+    Ok(())
+}
+
+/// Command jigs in effect may only run scripts from their protected place;
+/// a candidate (replay --file, the propose gate) may run any.
+static ANY_SCRIPT_PLACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Every recorded event, classified, ordered by session then time.
 fn load_evs(l: &Ledger) -> anyhow::Result<Vec<episode::Ev>> {
     let mut out = vec![];
@@ -644,6 +875,8 @@ fn replay(file: Option<PathBuf>) -> anyhow::Result<()> {
             let s = std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?;
             let f: JigFile =
                 serde_json::from_str(&s).with_context(|| format!("parse {}", p.display()))?;
+            // A candidate's scripts are still in the repo.
+            ANY_SCRIPT_PLACE.store(true, std::sync::atomic::Ordering::Relaxed);
             f.jigs
         }
         None => load_jigs()?,
@@ -847,6 +1080,8 @@ fn propose(file: &std::path::Path, dry_run: bool) -> anyhow::Result<()> {
         );
     }
     let l = ledger()?;
+    // A candidate runs its scripts where they are (in the repo).
+    ANY_SCRIPT_PLACE.store(true, std::sync::atomic::Ordering::Relaxed);
     let gate = match &d.candidate {
         proposal::Candidate::Jig { jig } => {
             let engine = Engine::new(vec![jig.clone()])?;
@@ -892,6 +1127,13 @@ fn propose(file: &std::path::Path, dry_run: bool) -> anyhow::Result<()> {
         println!("dry run: nothing stored");
         return Ok(());
     }
+    // Keep the scripts the gate just ran, and point the jig at the place
+    // accept will write them to.
+    let mut d = d;
+    if let proposal::Candidate::Jig { jig } = &mut d.candidate {
+        d.scripts = take_scripts(jig)?;
+    }
+    let s = serde_json::to_string_pretty(&d)?;
     let id = new_id();
     let gate_json = gate.as_ref().map(serde_json::to_string).transpose()?;
     let rejected = gate
@@ -955,10 +1197,28 @@ fn proposals(id: Option<String>) -> anyhow::Result<()> {
 fn put_jigs(file: &std::path::Path) -> anyhow::Result<()> {
     need_terminal("put-jigs")?;
     let s = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-    let parsed: JigFile =
-        serde_json::from_str(&s).with_context(|| format!("parse {}", file.display()))?;
+    let mut parsed: JigFile = serde_json::from_str(&s).with_context(|| {
+        format!(
+            "parse {} (`test_weakening` is now the script jig jigs/tests_weakened.py)",
+            file.display()
+        )
+    })?;
+    // Copy each command jig's scripts to their protected place and point
+    // argv there: the repo's copy can then change without changing a judge.
+    let mut placed = vec![];
+    for j in &mut parsed.jigs {
+        let scripts = take_scripts(j)?;
+        placed.push((j.id.clone(), scripts));
+    }
     // Refuse a file the hook could not load: bad regexes, empty argv.
-    Engine::new(jig::merge(jig::builtin(), parsed))?;
+    Engine::new(jig::merge(
+        jig::builtin(),
+        serde_json::from_value(serde_json::to_value(&parsed)?)?,
+    ))?;
+    for (id, scripts) in &placed {
+        place_scripts(id, scripts)?;
+    }
+    let s = serde_json::to_string_pretty(&parsed)? + "\n";
     let dest = home().join("jigs.json");
     std::fs::create_dir_all(home()).with_context(|| format!("create {}", home().display()))?;
     match std::fs::read_to_string(&dest) {
@@ -989,7 +1249,7 @@ fn put_jigs(file: &std::path::Path) -> anyhow::Result<()> {
 }
 
 fn accept(id: &str) -> anyhow::Result<()> {
-    need_terminal("accept")?;
+    let by = decider("accept", id)?;
     let l = ledger()?;
     let p = l.proposal_by_short(id)?;
     let d: proposal::Draft =
@@ -1020,6 +1280,8 @@ fn accept(id: &str) -> anyhow::Result<()> {
                     .with_context(|| format!("back up to {}", bak.display()))?;
                 println!("backup: {}", bak.display());
             }
+            // The scripts as the gate ran them, not as the repo has them now.
+            place_scripts(&jig.id, &d.scripts)?;
             file.jigs.push(jig.clone());
             std::fs::write(&path, serde_json::to_string_pretty(&file)? + "\n")
                 .with_context(|| format!("write {}", path.display()))?;
@@ -1033,8 +1295,8 @@ fn accept(id: &str) -> anyhow::Result<()> {
         }
         proposal::Candidate::Nothing => println!("nothing to install"),
     }
-    l.decide_proposal(&p.id, "accepted", None, now_ms())?;
-    println!("accepted {}", short(&p.id));
+    l.decide_proposal(&p.id, "accepted", None, now_ms(), &by)?;
+    println!("accepted {} by {by}", short(&p.id));
     Ok(())
 }
 
@@ -1044,6 +1306,20 @@ fn spawn_jig(argv: &[String], payload: &str, timeout_ms: u64) -> anyhow::Result<
     use std::io::Write;
     use std::process::{Command, Stdio};
     let home = std::env::var("HOME").context("HOME is not set; needed to expand $HOME/ in argv")?;
+    if !ANY_SCRIPT_PLACE.load(std::sync::atomic::Ordering::Relaxed) {
+        // A jig in effect runs only scripts put in place by a decider, so
+        // the agent cannot change a judge by editing the repo's copy.
+        let place = crate::home().join("jigs");
+        for (_, p) in script_args(argv)? {
+            if !p.starts_with(&place) {
+                anyhow::bail!(
+                    "script {} is outside {}: put the jigs file again (just jigs)",
+                    p.display(),
+                    place.display()
+                );
+            }
+        }
+    }
     let argv: Vec<String> = argv.iter().map(|a| jig::expand_home(a, &home)).collect();
     // Python exits 2 when it cannot open the script, which reads as a hit:
     // a missing file must be the jig failing, not a verdict (2026-11-14).
@@ -1058,6 +1334,17 @@ fn spawn_jig(argv: &[String], payload: &str, timeout_ms: u64) -> anyhow::Result<
     let start = std::time::Instant::now();
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
+        // A jig that reads the ledger calls this binary, as of this event.
+        .env(
+            "HOOKWATCH_BIN",
+            std::env::current_exe().context("own path")?,
+        )
+        .env(
+            "HOOKWATCH_EVENT_TS_MS",
+            jig::EVENT_TS_MS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

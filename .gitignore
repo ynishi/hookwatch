@@ -1,5 +1,6 @@
 # Rust build artifact
 target
+__pycache__/
 
 # Types and tsconfig Claude Code writes into a loaded mod for the editor
 plugin/.claude-plugin/types/
