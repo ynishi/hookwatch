@@ -5,13 +5,51 @@
       "description": "Markdown prose writes the lifecycle term as Shadow (rework 2026-11-14)",
       "rule": {
         "kind": "command",
-        "argv": ["python3", "-I", "$HOME/projects/hookwatch/jigs/term_shadow_md.py"],
+        "argv": [
+          "python3",
+          "-I",
+          "$HOME/projects/hookwatch/jigs/term_shadow_md.py"
+        ],
         "timeout_ms": 2000
       },
       "action": "nudge",
       "lifecycle": "enforce",
       "message": "用語は Shadow と表記する (人の直し 2026-11-14)",
-      "when": { "tools": ["Write", "Edit", "MultiEdit"], "path": "\\.md$" }
+      "when": {
+        "tools": [
+          "Write",
+          "Edit",
+          "MultiEdit"
+        ],
+        "path": "\\.md$"
+      }
+    },
+    {
+      "id": "term-shadow-md-v2",
+      "description": "Markdown sentences write the lifecycle term as Shadow; values stay lowercase",
+      "rule": {
+        "kind": "command",
+        "argv": [
+          "python3",
+          "-I",
+          "$HOME/projects/hookwatch/jigs/term_shadow_md_v2.py"
+        ],
+        "timeout_ms": 2000
+      },
+      "action": "nudge",
+      "lifecycle": "shadow",
+      "message": "用語は文の中では Shadow と表記する (人の直し 2026-11-14)",
+      "when": {
+        "tools": [
+          "Write",
+          "Edit",
+          "MultiEdit"
+        ],
+        "path": "\\.md$"
+      }
     }
-  ]
+  ],
+  "lifecycle": {
+    "term-shadow-md": "retired"
+  }
 }

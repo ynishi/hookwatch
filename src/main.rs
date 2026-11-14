@@ -9,8 +9,10 @@ mod episode;
 mod friction;
 mod jig;
 mod ledger;
+mod proposal;
 mod replay;
 mod rework;
+mod smith;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -77,6 +79,36 @@ enum Cmd {
         /// Without it, the jigs in effect are run.
         #[arg(long)]
         file: Option<PathBuf>,
+    },
+    /// Everything Jig Smith reads, as one JSON: episodes with the
+    /// conversation around each, the jigs in effect, earlier proposals, and
+    /// the places a written rule can go.
+    SmithInput {
+        /// How many of the newest episodes.
+        #[arg(long, default_value_t = 20)]
+        last: usize,
+        /// The repo whose rule files are listed.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Check a Jig Smith proposal (shape, validation cases, replay) and
+    /// store it. A failed gate stores it as rejected, with why.
+    Propose {
+        file: PathBuf,
+        /// Run the checks and print the report; store nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List proposals, or show one in full.
+    Proposals { id: Option<String> },
+    /// The human accepts an open proposal. A jig goes into jigs.json in
+    /// shadow. Needs a terminal: an agent cannot accept its own proposal.
+    Accept { id: String },
+    /// The human rejects an open proposal, with why. Needs a terminal.
+    Reject {
+        id: String,
+        #[arg(long)]
+        why: String,
     },
     /// List the jigs in effect (built-in + jigs.json).
     Jigs,
@@ -151,6 +183,18 @@ fn main() -> anyhow::Result<()> {
             context,
         } => episodes(json, last, context),
         Cmd::Replay { file } => replay(file),
+        Cmd::SmithInput { last, repo } => smith_input(last, &repo),
+        Cmd::Propose { file, dry_run } => propose(&file, dry_run),
+        Cmd::Proposals { id } => proposals(id),
+        Cmd::Accept { id } => accept(&id),
+        Cmd::Reject { id, why } => {
+            need_terminal("reject")?;
+            let l = ledger()?;
+            let p = l.proposal_by_short(&id)?;
+            l.decide_proposal(&p.id, "rejected", Some(&why), now_ms())?;
+            println!("rejected {} ({})", short(&p.id), p.intent);
+            Ok(())
+        }
         Cmd::Jigs => {
             for j in load_jigs()? {
                 println!(
@@ -389,6 +433,309 @@ fn replay(file: Option<PathBuf>) -> anyhow::Result<()> {
     println!(
         "ran = the call ran and nothing stopped it: a block there would have stopped normal work."
     );
+    Ok(())
+}
+
+/// Accepting and rejecting are the human's. Claude Code runs Bash without a
+/// terminal on stdin, so this stops an agent deciding its own proposal.
+fn need_terminal(what: &str) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("{what} needs a terminal: the human runs it, not an agent");
+    }
+    Ok(())
+}
+
+/// Files under `repo` a written rule can go in: *.md at the root and in
+/// docs/, and skills/*/SKILL.md.
+fn rule_places(repo: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let mut out = vec![];
+    let mut md_in = |dir: PathBuf, deep: bool| -> anyhow::Result<()> {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()), // the repo has no such dir
+            Err(e) => return Err(e).with_context(|| format!("list {}", dir.display())),
+        };
+        for e in entries {
+            let p = e?.path();
+            if deep {
+                let skill = p.join("SKILL.md");
+                if skill.is_file() {
+                    out.push(skill.display().to_string());
+                }
+            } else if p.extension().is_some_and(|x| x == "md") {
+                out.push(p.display().to_string());
+            }
+        }
+        Ok(())
+    };
+    md_in(repo.to_path_buf(), false)?;
+    md_in(repo.join("docs"), false)?;
+    md_in(repo.join("skills"), true)?;
+    out.sort();
+    Ok(out)
+}
+
+fn smith_input(last: usize, repo: &std::path::Path) -> anyhow::Result<()> {
+    let l = ledger()?;
+    let evs = load_evs(&l)?;
+    let all = episode::episodes(&evs, &l.rework_rows()?, &l.label_rows()?, 5);
+    let eps = &all[all.len().saturating_sub(last)..];
+    let mut transcripts: std::collections::HashMap<String, Option<String>> = Default::default();
+    let mut out_eps = vec![];
+    for e in eps {
+        let mut v = serde_json::to_value(e)?;
+        if e.kind == "rework" {
+            // The agent's last write to the file the human then changed: a
+            // validation case copies it exactly, so replay can confirm the hit.
+            let path = e.detail.get("path").and_then(|p| p.as_str());
+            let src = evs.iter().rev().find(|x| {
+                x.session == e.session
+                    && x.ts_ms < e.ts_ms
+                    && x.kind == "PreToolUse"
+                    && x.payload
+                        .pointer("/tool_input/file_path")
+                        .and_then(|p| p.as_str())
+                        == path
+            });
+            if let Some(x) = src {
+                v["source_call"] =
+                    serde_json::json!({"tool_name": x.tool, "tool_input": x.payload["tool_input"]});
+            }
+        }
+        if let Some(w) = &e.transcript {
+            if !transcripts.contains_key(&w.path) {
+                let body = read_if_exists(&w.path)?; // None: the transcript was deleted
+                transcripts.insert(w.path.clone(), body);
+            }
+            v["conversation"] = match &transcripts[&w.path] {
+                Some(body) => serde_json::to_value(smith::excerpt(body.lines(), &w.from, &w.to)?)?,
+                None => serde_json::json!({ "missing": w.path }),
+            };
+        }
+        out_eps.push(v);
+    }
+    let props: Vec<serde_json::Value> = l
+        .proposals()?
+        .iter()
+        .map(|p| serde_json::json!({"id": p.id, "status": p.status, "outlet": p.outlet, "intent": p.intent, "why": p.why}))
+        .collect();
+    let out = serde_json::json!({
+        "episodes": out_eps,
+        "jigs": load_jigs()?,
+        "proposals": props,
+        "rule_places": rule_places(repo)?,
+        "contract": "Write one proposal JSON (see docs/jig-smith.md) and run `hookwatch propose <file>`.",
+    });
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+fn outlet_name(c: &proposal::Candidate) -> &'static str {
+    match c {
+        proposal::Candidate::Jig { .. } => "jig",
+        proposal::Candidate::HookL2Pending { .. } => "l2_pending",
+        proposal::Candidate::Rule { .. } => "rule",
+        proposal::Candidate::Nothing => "nothing",
+    }
+}
+
+/// Run each case through the candidate jig alone.
+fn run_cases(
+    engine: &Engine,
+    cases: &[proposal::Case],
+) -> Vec<(proposal::Case, proposal::CaseResult)> {
+    use proposal::CaseResult;
+    cases
+        .iter()
+        .map(|c| {
+            let got = match ToolCall::from_claude(&c.tool_name, &c.tool_input, None) {
+                Err(e) => CaseResult::Error(format!("{e:#}")),
+                Ok(call) => {
+                    let payload = serde_json::json!({
+                        "hook_event_name": "PreToolUse", "tool_name": c.tool_name, "tool_input": c.tool_input
+                    })
+                    .to_string();
+                    let ev = engine.evaluate_with(&call, &payload, &mut spawn_jig);
+                    match ev.runs.iter().find_map(|r| match &r.outcome {
+                        jig::RunOutcome::Error(m) => Some(m.clone()),
+                        _ => None,
+                    }) {
+                        Some(m) => CaseResult::Error(m),
+                        None if ev.hits.is_empty() => CaseResult::Pass,
+                        None => CaseResult::Hit,
+                    }
+                }
+            };
+            (c.clone(), got)
+        })
+        .collect()
+}
+
+fn propose(file: &std::path::Path, dry_run: bool) -> anyhow::Result<()> {
+    let s = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    let d: proposal::Draft =
+        serde_json::from_str(&s).with_context(|| format!("parse {}", file.display()))?;
+    let shape = proposal::check_shape(&d);
+    if !shape.is_empty() {
+        anyhow::bail!(
+            "the proposal is not well formed (not stored):\n  {}",
+            shape.join("\n  ")
+        );
+    }
+    let l = ledger()?;
+    let gate = match &d.candidate {
+        proposal::Candidate::Jig { jig } => {
+            let engine = Engine::new(vec![jig.clone()])?;
+            let cases = run_cases(&engine, &d.cases);
+            let r = replay::run(&engine, &load_evs(&l)?, &mut spawn_jig);
+            // A hit is confirmed by a hit case, or by a human's right label.
+            let right = l.right_labelled_calls()?;
+            let hits: Vec<proposal::ReplayHit> = r
+                .jigs
+                .into_iter()
+                .flat_map(|j| j.all)
+                .map(|(out, tool, input, evidence)| proposal::ReplayHit {
+                    ran: out == "ran",
+                    confirmed: d.cases.iter().any(|c| {
+                        c.expect == proposal::Expect::Hit
+                            && c.tool_name == tool
+                            && c.tool_input == input
+                    }) || right.iter().any(|(t, i)| *t == tool && *i == input),
+                    evidence,
+                })
+                .collect();
+            Some(proposal::gate(jig.action, &cases, &hits))
+        }
+        _ => None, // rules and nothing are judged by the human alone
+    };
+    if let Some(g) = &gate {
+        println!(
+            "gate: {} (cases {}/{}, replay hits {}, unconfirmed {})",
+            if g.passed { "passed" } else { "FAILED" },
+            g.cases_ok,
+            g.cases,
+            g.replay_hits,
+            g.unconfirmed
+        );
+        for f in &g.failures {
+            println!("  - {f}");
+        }
+        for s in &g.unconfirmed_samples {
+            println!("  unconfirmed: {s}");
+        }
+    }
+    if dry_run {
+        println!("dry run: nothing stored");
+        return Ok(());
+    }
+    let id = new_id();
+    let gate_json = gate.as_ref().map(serde_json::to_string).transpose()?;
+    let rejected = gate
+        .as_ref()
+        .filter(|g| !g.passed)
+        .map(|g| g.failures.join("; "));
+    l.add_proposal(
+        &id,
+        now_ms(),
+        &d.intent,
+        outlet_name(&d.candidate),
+        &s,
+        gate_json.as_deref(),
+        rejected.as_deref(),
+    )?;
+    match rejected {
+        Some(_) => println!("stored {} as rejected by the gate", short(&id)),
+        None => println!(
+            "stored {} as open: the human runs `hookwatch proposals {}`",
+            short(&id),
+            short(&id)
+        ),
+    }
+    Ok(())
+}
+
+fn proposals(id: Option<String>) -> anyhow::Result<()> {
+    let l = ledger()?;
+    match id {
+        None => {
+            for p in l.proposals()? {
+                println!(
+                    "{}  {:>4} ago  {:<9} {:<10} {}",
+                    short(&p.id),
+                    ago(p.ts_ms),
+                    p.status,
+                    p.outlet,
+                    p.intent
+                );
+            }
+        }
+        Some(id) => {
+            let p = l.proposal_by_short(&id)?;
+            println!("proposal  {} ({}, {} ago)", p.id, p.status, ago(p.ts_ms));
+            if let Some(by) = &p.decided_by {
+                println!("decided   by {by}: {}", p.why.as_deref().unwrap_or("-")); // accepted carries no why
+            }
+            let d: serde_json::Value =
+                serde_json::from_str(&p.draft).context("stored draft is not JSON")?;
+            println!("{}", serde_json::to_string_pretty(&d)?);
+            if let Some(g) = &p.gate {
+                let g: serde_json::Value =
+                    serde_json::from_str(g).context("stored gate is not JSON")?;
+                println!("gate {}", serde_json::to_string_pretty(&g)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn accept(id: &str) -> anyhow::Result<()> {
+    need_terminal("accept")?;
+    let l = ledger()?;
+    let p = l.proposal_by_short(id)?;
+    let d: proposal::Draft =
+        serde_json::from_str(&p.draft).context("stored draft is not a proposal")?;
+    match &d.candidate {
+        proposal::Candidate::Jig { jig } => {
+            let path = home().join("jigs.json");
+            let mut file = match std::fs::read_to_string(&path) {
+                Ok(s) => serde_json::from_str::<JigFile>(&s)
+                    .with_context(|| format!("parse {}", path.display()))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => JigFile::default(),
+                Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+            };
+            let in_effect = load_jigs()?;
+            if in_effect.iter().any(|j| j.id == jig.id) {
+                anyhow::bail!("a jig with id {} is already in effect", jig.id);
+            }
+            if let Some(old) = &d.replaces {
+                if !in_effect.iter().any(|j| j.id == *old) {
+                    anyhow::bail!("replaces {old}, but no such jig is in effect");
+                }
+                file.lifecycle.insert(old.clone(), jig::Lifecycle::Retired);
+                println!("retired jig {old}");
+            }
+            if path.exists() {
+                let bak = path.with_extension(format!("json.bak.{}", now_ms()));
+                std::fs::copy(&path, &bak)
+                    .with_context(|| format!("back up to {}", bak.display()))?;
+                println!("backup: {}", bak.display());
+            }
+            file.jigs.push(jig.clone());
+            std::fs::write(&path, serde_json::to_string_pretty(&file)? + "\n")
+                .with_context(|| format!("write {}", path.display()))?;
+            println!("added jig {} to {} in shadow", jig.id, path.display());
+        }
+        proposal::Candidate::Rule { file, text } => {
+            println!("apply this rule yourself, in {file}:\n\n{text}\n");
+        }
+        proposal::Candidate::HookL2Pending { question } => {
+            println!("kept for the L2 judge (not installed): {question}");
+        }
+        proposal::Candidate::Nothing => println!("nothing to install"),
+    }
+    l.decide_proposal(&p.id, "accepted", None, now_ms())?;
+    println!("accepted {}", short(&p.id));
     Ok(())
 }
 

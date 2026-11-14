@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS snapshots (
   id TEXT PRIMARY KEY, session TEXT NOT NULL, path TEXT NOT NULL, ts_ms INTEGER NOT NULL,
   content TEXT NOT NULL, checked INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS snapshots_open ON snapshots(session, checked);
+-- Proposals from Jig Smith. Kept when rejected, so the same idea is not
+-- proposed again without saying what changed.
+CREATE TABLE IF NOT EXISTS proposals (
+  id TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL, intent TEXT NOT NULL, outlet TEXT NOT NULL,
+  draft TEXT NOT NULL, gate TEXT,
+  status TEXT NOT NULL CHECK (status IN ('open','accepted','rejected','retired')),
+  decided_by TEXT CHECK (decided_by IN ('gate','human')), why TEXT, decided_ts_ms INTEGER);
 -- Every run of a command jig: hookwatch's stopwatch on the jigs themselves.
 CREATE TABLE IF NOT EXISTS jig_runs (
   id TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL, event_id TEXT NOT NULL REFERENCES events(id),
@@ -100,6 +107,35 @@ pub struct Snapshot {
     pub id: String,
     pub path: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProposalRow {
+    pub id: String,
+    pub ts_ms: i64,
+    pub intent: String,
+    pub outlet: String,
+    pub draft: String,
+    pub gate: Option<String>,
+    pub status: String,
+    pub decided_by: Option<String>,
+    pub why: Option<String>,
+}
+
+const PROPOSAL_COLS: &str = "id, ts_ms, intent, outlet, draft, gate, status, decided_by, why";
+
+fn proposal_from(r: &rusqlite::Row) -> rusqlite::Result<ProposalRow> {
+    Ok(ProposalRow {
+        id: r.get(0)?,
+        ts_ms: r.get(1)?,
+        intent: r.get(2)?,
+        outlet: r.get(3)?,
+        draft: r.get(4)?,
+        gate: r.get(5)?,
+        status: r.get(6)?,
+        decided_by: r.get(7)?,
+        why: r.get(8)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +313,95 @@ impl Ledger {
         }
         tx.execute("UPDATE snapshots SET checked = 1 WHERE id = ?1", [&snap.id])?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Store a proposal. A gate that failed closes it at once as rejected.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_proposal(
+        &self,
+        id: &str,
+        ts_ms: i64,
+        intent: &str,
+        outlet: &str,
+        draft: &str,
+        gate: Option<&str>,
+        rejected_by_gate: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let (status, by, why) = match rejected_by_gate {
+            Some(w) => ("rejected", Some("gate"), Some(w)),
+            None => ("open", None, None),
+        };
+        let decided = by.map(|_| ts_ms);
+        self.conn.execute(
+            "INSERT INTO proposals (id, ts_ms, intent, outlet, draft, gate, status, decided_by, why, decided_ts_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![id, ts_ms, intent, outlet, draft, gate, status, by, why, decided],
+        )?;
+        Ok(())
+    }
+
+    /// All proposals, newest first.
+    pub fn proposals(&self) -> anyhow::Result<Vec<ProposalRow>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {PROPOSAL_COLS} FROM proposals ORDER BY ts_ms DESC"
+        ))?;
+        let rows = st.query_map([], proposal_from)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// One proposal by the start or end of its id; more than one match is an error.
+    pub fn proposal_by_short(&self, part: &str) -> anyhow::Result<ProposalRow> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {PROPOSAL_COLS} FROM proposals WHERE id LIKE ?1 || '%' OR id LIKE '%' || ?1 LIMIT 2"
+        ))?;
+        let mut rows: Vec<ProposalRow> = st
+            .query_map([part], proposal_from)?
+            .collect::<Result<_, _>>()?;
+        match rows.len() {
+            0 => anyhow::bail!("no proposal with id {part}"),
+            1 => Ok(rows.remove(0)),
+            _ => anyhow::bail!("id {part} matches more than one proposal; give more characters"),
+        }
+    }
+
+    /// (tool_name, tool_input) of every call whose verdict the human last
+    /// labelled right: hits a human has confirmed.
+    pub fn right_labelled_calls(&self) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+        let mut st = self.conn.prepare(
+            "SELECT e.payload FROM verdicts v JOIN events e ON e.id = v.event_id
+             WHERE (SELECT l.label FROM labels l WHERE l.verdict_id = v.id ORDER BY l.ts_ms DESC LIMIT 1) = 'right'",
+        )?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = vec![];
+        for p in rows {
+            let v: serde_json::Value =
+                serde_json::from_str(&p?).context("ledger payload is not JSON")?;
+            let tool = v
+                .get("tool_name")
+                .and_then(|t| t.as_str())
+                .context("labelled call has no tool_name")?;
+            out.push((tool.to_owned(), v["tool_input"].clone()));
+        }
+        Ok(out)
+    }
+
+    /// A human decides an open proposal. Deciding a closed one is an error.
+    pub fn decide_proposal(
+        &self,
+        id: &str,
+        status: &str,
+        why: Option<&str>,
+        ts_ms: i64,
+    ) -> anyhow::Result<()> {
+        let n = self.conn.execute(
+            "UPDATE proposals SET status = ?2, decided_by = 'human', why = ?3, decided_ts_ms = ?4
+             WHERE id = ?1 AND status = 'open'",
+            params![id, status, why, ts_ms],
+        )?;
+        if n != 1 {
+            anyhow::bail!("proposal {id} is not open");
+        }
         Ok(())
     }
 
@@ -629,6 +754,39 @@ mod tests {
                 added: 3,
                 removed: 1
             }
+        );
+    }
+
+    #[test]
+    fn proposal_gate_rejection_is_kept_and_open_ones_are_decided_once() {
+        let l = Ledger::in_memory().unwrap();
+        l.add_proposal("p1", 1, "i", "jig", "{}", Some("{}"), None)
+            .unwrap();
+        l.add_proposal(
+            "p2",
+            2,
+            "i",
+            "jig",
+            "{}",
+            Some("{}"),
+            Some("2 unconfirmed hits"),
+        )
+        .unwrap();
+        let all = l.proposals().unwrap();
+        assert_eq!(
+            all.iter().map(|p| p.status.as_str()).collect::<Vec<_>>(),
+            vec!["rejected", "open"]
+        );
+        assert_eq!(all[0].decided_by.as_deref(), Some("gate"));
+        assert!(l.decide_proposal("p2", "accepted", None, 3).is_err());
+        l.decide_proposal("p1", "accepted", None, 3).unwrap();
+        assert!(
+            l.decide_proposal("p1", "rejected", Some("again"), 4)
+                .is_err()
+        );
+        assert_eq!(
+            l.proposal_by_short("p1").unwrap().decided_by.as_deref(),
+            Some("human")
         );
     }
 

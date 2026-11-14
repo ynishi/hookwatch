@@ -12,6 +12,9 @@ pub struct JigReplay {
     pub outcomes: BTreeMap<&'static str, usize>,
     /// Up to 3 hits: "outcome | evidence".
     pub samples: Vec<String>,
+    /// Every hit: (outcome, tool_name, tool_input, evidence). For gates that
+    /// must tell confirmed hits from unconfirmed ones.
+    pub all: Vec<(&'static str, String, serde_json::Value, String)>,
 }
 
 pub struct Report {
@@ -102,12 +105,15 @@ pub fn run(engine: &Engine, events: &[Ev], run: &mut Runner) -> Report {
                 hits: 0,
                 outcomes: BTreeMap::new(),
                 samples: vec![],
+                all: vec![],
             });
             r.hits += 1;
             *r.outcomes.entry(out).or_insert(0) += 1;
             if r.samples.len() < 3 {
                 r.samples.push(format!("{out} | {}", h.evidence));
             }
+            r.all
+                .push((out, tool.to_owned(), input.clone(), h.evidence.clone()));
         }
     }
     report.jigs = by_jig.into_values().collect();
