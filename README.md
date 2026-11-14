@@ -23,6 +23,7 @@ hookwatch は Claude Code の hook として動き、agent の作業を 2 つの
 | `hookwatch override <id> --wrong\|--right` | 判定に人のラベルを付ける |
 | `hookwatch events` | 記録した event を古い順に出す |
 | `hookwatch jigs` | 効いている治具の一覧 |
+| `hookwatch put-jigs <file>` | 治具の file を効かせる (前の file は写しを残す)。端末が要る (人だけ)。`just jigs` は repo の `jigs/jigs.json` でこれを呼ぶ |
 | `hookwatch install` | settings に足す hooks の JSON を出す |
 
 記録は `$HOME/.hookwatch/ledger.db`、治具の追加と lifecycle の上書きは `$HOME/.hookwatch/jigs.json` に置く (`HOOKWATCH_HOME` で場所を変えられる)。

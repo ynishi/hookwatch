@@ -112,6 +112,10 @@ enum Cmd {
     },
     /// List the jigs in effect (built-in + jigs.json).
     Jigs,
+    /// Put a jigs file in effect (copied to $HOOKWATCH_HOME/jigs.json, the
+    /// old one backed up). Needs a terminal: it changes which jigs judge the
+    /// agent, so the agent cannot run it.
+    PutJigs { file: PathBuf },
     /// Print the hooks block to add to Claude Code's settings.
     Install,
 }
@@ -187,6 +191,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Propose { file, dry_run } => propose(&file, dry_run),
         Cmd::Proposals { id } => proposals(id),
         Cmd::Accept { id } => accept(&id),
+        Cmd::PutJigs { file } => put_jigs(&file),
         Cmd::Reject { id, why } => {
             need_terminal("reject")?;
             let l = ledger()?;
@@ -685,6 +690,42 @@ fn proposals(id: Option<String>) -> anyhow::Result<()> {
                 println!("gate {}", serde_json::to_string_pretty(&g)?);
             }
         }
+    }
+    Ok(())
+}
+
+fn put_jigs(file: &std::path::Path) -> anyhow::Result<()> {
+    need_terminal("put-jigs")?;
+    let s = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    let parsed: JigFile =
+        serde_json::from_str(&s).with_context(|| format!("parse {}", file.display()))?;
+    // Refuse a file the hook could not load: bad regexes, empty argv.
+    Engine::new(jig::merge(jig::builtin(), parsed))?;
+    let dest = home().join("jigs.json");
+    std::fs::create_dir_all(home()).with_context(|| format!("create {}", home().display()))?;
+    match std::fs::read_to_string(&dest) {
+        Ok(old) if old == s => {
+            println!("{} is already the same", dest.display());
+            return Ok(());
+        }
+        Ok(_) => {
+            let bak = dest.with_extension(format!("json.bak.{}", now_ms()));
+            std::fs::copy(&dest, &bak).with_context(|| format!("back up to {}", bak.display()))?;
+            println!("backup: {}", bak.display());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // the first jigs file
+        Err(e) => return Err(e).with_context(|| format!("read {}", dest.display())),
+    }
+    std::fs::write(&dest, &s).with_context(|| format!("write {}", dest.display()))?;
+    println!("installed: {}", dest.display());
+    for j in load_jigs()? {
+        println!(
+            "{:<18} {:<8} {:<6} {}",
+            j.id,
+            j.lifecycle.as_str(),
+            j.action.as_str(),
+            j.description
+        );
     }
     Ok(())
 }
