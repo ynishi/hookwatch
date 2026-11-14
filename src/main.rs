@@ -317,11 +317,12 @@ fn hook() -> anyhow::Result<i32> {
             for_human.push(format!("hookwatch: {}", lines.join(" / ")));
         }
     }
+    let mut granted = false;
     if event == "PreToolUse"
         && tool == Some("Bash")
         && let Some(cmd) = v.pointer("/tool_input/command").and_then(|c| c.as_str())
     {
-        note_grant(&l, &v, cmd, ts)?;
+        granted = note_grant(&l, &v, cmd, ts)?;
     }
     let call = if event == "PreToolUse" {
         let tool = tool.context("PreToolUse input has no tool_name")?;
@@ -405,19 +406,30 @@ fn hook() -> anyhow::Result<i32> {
         return Ok(2);
     }
     let mut out = serde_json::Map::new();
+    let mut specific = serde_json::Map::new();
+    if granted {
+        // A block above returned already; deny / ask rules still win.
+        specific.insert("permissionDecision".into(), "allow".into());
+        specific.insert(
+            "permissionDecisionReason".into(),
+            "hookwatch: a role agent named in deciders.json decides this proposal (one-time grant)"
+                .into(),
+        );
+    }
     if !nudges.is_empty() {
         match event {
             // These events take context for the agent.
             "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "UserPromptSubmit" => {
-                out.insert(
-                    "hookSpecificOutput".into(),
-                    serde_json::json!({"hookEventName": event, "additionalContext": nudges.join("\n")}),
-                );
+                specific.insert("additionalContext".into(), nudges.join("\n").into());
             }
             // A turn's end, a session's start: tell the human; the agent
             // is not made to go on.
             _ => for_human.extend(nudges),
         }
+    }
+    if !specific.is_empty() {
+        specific.insert("hookEventName".into(), event.into());
+        out.insert("hookSpecificOutput".into(), specific.into());
     }
     if !for_human.is_empty() {
         out.insert("systemMessage".into(), for_human.join("\n").into());
@@ -703,27 +715,72 @@ const GRANT_MS: i64 = 60_000;
 /// At PreToolUse: when a role agent named in deciders.json runs
 /// `hookwatch accept|reject <id>`, leave it a one-time grant. The agent type
 /// comes from Claude Code's hook input; the main agent has none.
-fn note_grant(l: &Ledger, v: &serde_json::Value, cmd: &str, ts: i64) -> anyhow::Result<()> {
-    use std::sync::LazyLock;
-    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"^\s*(?:\S*/)?hookwatch\s+(accept|reject)\s+([0-9a-f-]+)\b").unwrap()
-    });
-    let Some(c) = RE.captures(cmd) else {
-        return Ok(());
+/// Returns true when it left a grant: the hook then lets this one call
+/// through the permission check (the role agent's decision is hookwatch's
+/// to allow, not the auto mode classifier's).
+fn note_grant(l: &Ledger, v: &serde_json::Value, cmd: &str, ts: i64) -> anyhow::Result<bool> {
+    let Some((op, target)) = deciding_command(cmd) else {
+        return Ok(false);
     };
     let Some(agent_type) = v.get("agent_type").and_then(|x| x.as_str()) else {
-        return Ok(()); // the main agent: no role
+        return Ok(false); // the main agent: no role
     };
     let d = deciders()?;
-    let allowed = match &c[1] {
+    let allowed = match op.as_str() {
         "accept" => &d.accept,
         _ => &d.reject,
     };
-    if allowed.iter().any(|a| a == agent_type) {
-        let agent_id = v.get("agent_id").and_then(|x| x.as_str());
-        l.add_grant(&new_id(), ts, &c[1], &c[2], agent_type, agent_id)?;
+    if !allowed.iter().any(|a| a == agent_type) {
+        return Ok(false);
     }
-    Ok(())
+    let agent_id = v.get("agent_id").and_then(|x| x.as_str());
+    l.add_grant(&new_id(), ts, &op, &target, agent_type, agent_id)?;
+    Ok(true)
+}
+
+/// (op, proposal id) when the whole command is `hookwatch accept|reject <id>`.
+fn deciding_command(cmd: &str) -> Option<(String, String)> {
+    use std::sync::LazyLock;
+    // The whole command must be the deciding command, nothing chained: the
+    // hook allows it. A reason is quoted text without $, ` or \ (no
+    // expansion in the shell).
+    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r#"^\s*hookwatch\s+(accept|reject)\s+([0-9a-f-]+)(?:\s+--why\s+(?:'[^']*'|"[^"$`\\]*"))?\s*$"#,
+        )
+        .unwrap()
+    });
+    let c = RE.captures(cmd)?;
+    Some((c[1].to_owned(), c[2].to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deciding_command;
+
+    #[test]
+    fn only_the_bare_deciding_command_counts() {
+        let ok = |c: &str| deciding_command(c).is_some();
+        assert_eq!(
+            deciding_command("hookwatch accept 479a7f4d"),
+            Some(("accept".into(), "479a7f4d".into()))
+        );
+        assert!(ok(
+            r#"hookwatch reject 479a7f4d --why "gate cases are one-sided""#
+        ));
+        assert!(ok("hookwatch reject 479a7f4d --why 'x; y'"));
+        for bad in [
+            "hookwatch accept 479a7f4d; rm -rf x",
+            "hookwatch accept 479a7f4d && echo",
+            "cd /r && hookwatch accept 479a7f4d",
+            r#"hookwatch reject 479a7f4d --why "$(touch x)""#,
+            "hookwatch reject 479a7f4d --why \"a\" ; ls",
+            "/tmp/evil/hookwatch accept 479a7f4d",
+            "hookwatch override 479a7f4d --right",
+        ] {
+            assert!(!ok(bad), "{bad}");
+        }
+    }
 }
 
 /// Who runs this deciding command: "human" at a terminal, else
