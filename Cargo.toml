@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Friction-measured hook engine (jigs) for coding agents"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/ynishi/hookwatch"
 authors = ["Yutaka Nishimura <ytk.nishimura@gmail.com>"]
 publish = false
 
